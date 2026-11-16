@@ -2,10 +2,10 @@
 
 1. **Zero macOS Compilation Rule**:
    - **NEVER** execute `cargo` or `rustc` locally on macOS.
-   - Run all compilation, clippy, and tests remotely over SSH on `bb2` using an isolated remote directory (`/tmp/keygate-build`) wrapped in `SWARM_MEM_MAX=12G timeout --kill-after=10s 600s`:
+   - Run all compilation, clippy, and tests remotely over SSH on a designated Linux build host (`BUILD_HOST`) using an isolated remote directory (`/tmp/keygate-build`) wrapped in `SWARM_MEM_MAX=12G timeout --kill-after=10s 600s`:
      ```bash
-     rsync -az --delete --exclude target --exclude .git /Users/ember/dev/keygate/ bb2:/tmp/keygate-build/
-     ssh bb2 'cd /tmp/keygate-build && CARGO_TARGET_DIR=/tmp/keygate-build/target timeout --kill-after=10s 600s cargo test --workspace'
+     rsync -az --delete --exclude target --exclude .git ./ "$BUILD_HOST":/tmp/keygate-build/
+     ssh "$BUILD_HOST" 'cd /tmp/keygate-build && CARGO_TARGET_DIR=/tmp/keygate-build/target timeout --kill-after=10s 600s cargo test --workspace'
      ```
 2. **Security & Performance Laws (TigerStyle)**:
    - **Zero `curl` subprocesses and zero sleep-polling**: Use native async Rust I/O (`tokio` + `reqwest`/`hyper` with `rustls`) for both buffered and SSE/chunked streaming upstream calls.
