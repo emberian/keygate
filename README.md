@@ -38,6 +38,54 @@ To check the arrangement between real uids without root, run `scripts/multiuid-a
 
 The workspace contains `keygate-core` (sealing, macaroons, guard, journal, audit, config), `keygate-broker` (engine, Unix socket and HTTP gateway) and the `keygate` CLI. See [SPEC.md](SPEC.md) for the design contract; figures there are design goals unless identified as measurements, and the measurements are in HARDENING.md.
 
+## Long-running service clients
+
+Run the broker under a separate uid and give each agent a UID-bound token over
+the Unix socket. Configure one service row per origin; two rows may hold the
+same upstream bearer, but their tickets are distinct. Renew tokens through an
+operator process, without giving the agent operator authority or an unbounded
+parent token.
+
+A one-day `ExpiresAtUnixS` with renewal ahead of expiry is a reasonable starting
+policy. Use jitter and enough overlap to tolerate renewal failures. Renewal
+means minting a fresh token: attenuation cannot extend an expiry. Each request
+carries its token; minting a replacement does not change an existing stream.
+At its original token's expiry, that stream closes with `closed_by: expired`.
+Reconnect with the replacement token and the service's resume cursor when
+supported (`last_event_id` requires the row to allow `Last-Event-ID`).
+
+Dispatch on Unix frame codes and stream summaries, not the HTTP gateway's status
+mapping:
+
+| Result | Client action |
+|---|---|
+| `no_secret` | Back off with jitter; retry admission after the operator re-seals the row. |
+| `revoked` / `closed_by: revoked` | Re-authorize before opening another stream. Both row and seat revocation use this result; a revoked seat then gets `denied`. |
+| `closed_by: expired` | Use the scheduled renewal path and reconnect with a fresh token. |
+| `denied` | Stop using that token. Check its known expiry for an expected renewal; otherwise report the policy refusal. Re-sealing a bearer cannot fix it. |
+| `method_refused`, `path_refused`, `header_refused`, `too_large` | Correct the request or policy before retrying. |
+| `uncertain` | Reconcile the operation with the upstream; do not create a new request to bypass the refusal. |
+| `no_resend_ledger_full` | Pause new work and alert the operator; retry admission with backoff while expired records become eligible for collection. |
+
+**Keep retries tied to the original operation and token.** A refreshed or
+attenuated token, a different row, or a new request id creates a different
+ticket. None inherits the original ticket's no-resend protection. Keep the
+original token for exact retries while it is valid and the ticket is retained.
+Never automatically resend an uncertain POST under a replacement token or a
+failover row. That requires upstream operation-level idempotency or confirmation
+of the original outcome. An ended stream's exact retry returns its summary
+(`spent: true`), not a reopened stream; a deliberate reconnect is a new request.
+
+The default `max_uncertain_tickets = 10000` is a broker-wide ceiling on unknown
+outcomes, not daily request volume. Size it for the number of uncertain outcomes
+that can accumulate during the retention/token-lifetime window, including
+failure bursts across all agents. A record is eligible for collection only after
+both its retention deadline and its owner's expiry (or seat revocation).
+Renewing a token does not revoke its predecessor or immediately collect its
+records. Tokens with no expiry on a never-revoked seat retain uncertain records
+indefinitely. At the ceiling, the broker refuses new requests rather than forget
+an outcome that could still be retried.
+
 ## License
 
 Licensed under either the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option.
