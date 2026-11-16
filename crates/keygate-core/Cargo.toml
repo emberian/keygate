@@ -1,0 +1,26 @@
+[package]
+name = "keygate-core"
+description = "keygate custody primitives: sealing, macaroons, EchoGuard, ticket journal, audit log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

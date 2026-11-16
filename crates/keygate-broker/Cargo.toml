@@ -1,0 +1,28 @@
+[package]
+name = "keygate-broker"
+description = "keygate broker engine: async upstream relay, Unix-socket protocol, loopback HTTP gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+keygate-core.workspace = true
+base64.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
