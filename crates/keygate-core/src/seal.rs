@@ -19,8 +19,20 @@ const SEAL_LABEL: &[u8] = b"keygate-seal/v1";
 const MAGIC_V1: &[u8; 4] = b"KGS1";
 /// Format 2 adds length prefixes and the retired, guard-only secrets.
 const MAGIC: &[u8; 4] = b"KGS2";
-/// Retired secrets kept per row for the response guard.
+/// Retired secrets a row with an active secret may keep for the response
+/// guard. A row with no active secret (revoked) may keep one more: the
+/// secret it had when it was revoked. Either way a row holds at most
+/// `MAX_RETIRED + 1` secrets.
 pub const MAX_RETIRED: usize = 8;
+
+/// The most retired secrets a row may hold, given whether it has an active one.
+pub const fn max_retired(has_active: bool) -> usize {
+    if has_active {
+        MAX_RETIRED
+    } else {
+        MAX_RETIRED + 1
+    }
+}
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const MASTER_KEY_LEN: usize = 32;
@@ -147,7 +159,7 @@ impl SealStore {
 
     pub fn seal(&self, ns: Namespace, row: &str, sealed: &SealedRow) -> Result<Vec<u8>, SealError> {
         check_row(row)?;
-        if sealed.retired.len() > MAX_RETIRED {
+        if sealed.retired.len() > max_retired(sealed.secret.is_some()) {
             return Err(SealError::Malformed {
                 ns,
                 row: row.to_owned(),
@@ -253,7 +265,7 @@ impl SealStore {
                 let len = cursor.len()?;
                 let secret = cursor.take(len)?;
                 let count = cursor.len()?;
-                if count > MAX_RETIRED {
+                if count > max_retired(has_secret) {
                     return None;
                 }
                 for _ in 0..count {
@@ -499,14 +511,32 @@ mod tests {
         assert!(back.secret.is_none());
         assert_eq!(back.retired.len(), 2);
 
-        // More than the cap is refused at seal time.
-        sealed.retired = (0..=MAX_RETIRED as u64)
-            .map(|g| RetiredSecret {
-                generation: g,
-                secret: SecretBytes::new(b"retired-secret-xxxx".to_vec()),
-            })
-            .collect();
+        // The caps are refused at seal time: eight beside an active
+        // secret, nine on a revoked row (the eight plus the one revoked).
+        let retired = |n: u64| -> Vec<RetiredSecret> {
+            (0..n)
+                .map(|g| RetiredSecret {
+                    generation: g,
+                    secret: SecretBytes::new(b"retired-secret-xxxx".to_vec()),
+                })
+                .collect()
+        };
+        sealed.retired = retired(MAX_RETIRED as u64 + 1);
+        let tombstone = s.seal(Namespace::Service, "api", &sealed).unwrap();
+        assert_eq!(
+            s.open(Namespace::Service, "api", &tombstone)
+                .unwrap()
+                .retired
+                .len(),
+            MAX_RETIRED + 1
+        );
+        sealed.retired = retired(MAX_RETIRED as u64 + 2);
         assert!(s.seal(Namespace::Service, "api", &sealed).is_err());
+        sealed.secret = Some(SecretBytes::new(b"current-secret-0003".to_vec()));
+        sealed.retired = retired(MAX_RETIRED as u64 + 1);
+        assert!(s.seal(Namespace::Service, "api", &sealed).is_err());
+        sealed.retired = retired(MAX_RETIRED as u64);
+        assert!(s.seal(Namespace::Service, "api", &sealed).is_ok());
 
         // Format 1, as written before retired secrets existed.
         let mut plain = Vec::new();

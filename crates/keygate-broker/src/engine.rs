@@ -344,6 +344,7 @@ impl Broker {
             config.broker.retention_s,
             options.journal_faults,
         )?;
+        journal.set_max_uncertain(config.broker.max_uncertain_tickets);
         let audit = match options.audit {
             Some(audit) => audit,
             None => AuditLog::open(&state_dir.join(AUDIT_FILE))?,
@@ -356,6 +357,18 @@ impl Broker {
         };
         // `validate` guarantees a separated deployment lists its operators;
         // only a development broker falls back to the state dir's owner.
+        // The journal keeps its own copy of each seat's revocation floor,
+        // because it decides from it when a no-resend record may be
+        // dropped. Reconcile it with the seat file in case an earlier
+        // revocation was persisted there but not journaled.
+        let seats: BTreeMap<String, u64> = seats;
+        for (seat, epoch) in &seats {
+            if journal.seat_floor(seat) < *epoch {
+                journal
+                    .revoke_seat(seat, *epoch)
+                    .map_err(keygate_core::journal::JournalError::Io)?;
+            }
+        }
         let operator_uids = if config.broker.operator_uids.is_empty() {
             vec![std::fs::metadata(state_dir)?.uid()]
         } else {
@@ -664,6 +677,10 @@ impl Broker {
         let bytes = serde_json::to_vec_pretty(&next)
             .map_err(|e| Refusal::new(Code::Internal, e.to_string()))?;
         let persisted = write_atomic(&self.inner.state_dir.join(SEATS_FILE), &bytes);
+        // Only once this floor is durable in the journal may the old
+        // tokens' no-resend records be dropped. If it cannot be written
+        // they are simply kept; the next start reconciles.
+        let journaled = self.inner.journal.revoke_seat(seat, epoch);
         let audited = self.inner.audit.append(&AuditEvent::Admin {
             action: "revoke-seat",
             uid: by.uid,
@@ -681,6 +698,12 @@ impl Broker {
             Refusal::new(
                 Code::AuditFailed,
                 format!("seat IS revoked, but the audit record failed: {e}"),
+            )
+        })?;
+        journaled.map_err(|e| {
+            Refusal::new(
+                Code::JournalFailed,
+                format!("seat IS revoked, but journaling its floor failed: {e}"),
             )
         })?;
         Ok(epoch)
@@ -1008,9 +1031,14 @@ impl Broker {
                 reserve_micro_usd: p.reserve_micro_usd,
                 now_unix_s: p.admitted_unix_s,
                 live_ttl_s: self.inner.cfg.live_ttl_s,
+                owner_expires_unix_s: p.expires_at_unix_s,
+                root_epoch: p.root_epoch,
             })
             .map_err(|e| match e {
                 JournalError::Budget { .. } => Refusal::new(Code::BudgetExceeded, e.to_string()),
+                JournalError::UncertainFull { .. } => {
+                    Refusal::new(Code::NoResendLedgerFull, e.to_string())
+                }
                 other => Refusal::new(Code::JournalFailed, other.to_string()),
             })
     }
@@ -1659,7 +1687,7 @@ fn not_live(ticket: &Ticket) -> Refusal {
         TicketState::InFlight => Refusal::new(Code::InFlight, "an identical request is in flight; use a distinct request_id for a deliberate repeat"),
         TicketState::Uncertain => Refusal::new(
             Code::Uncertain,
-            "an earlier attempt of this exact request may have reached the upstream and its reply was lost; it will not be re-sent. Use a new request_id to send again deliberately",
+            "an earlier attempt of this exact request may have reached the upstream and its reply was lost; it will not be re-sent, now or later, while this token is valid. To send it again deliberately, give it a new request id (Idempotency-Key)",
         ),
         TicketState::Withheld { .. } => withheld_refusal(),
         TicketState::Closed(summary) => {

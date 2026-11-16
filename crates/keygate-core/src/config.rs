@@ -76,6 +76,10 @@ pub struct BrokerCfg {
     pub retention_s: u64,
     /// Rewrite the journal after this many appended records.
     pub compact_every: u64,
+    /// Ceiling on requests of unknown outcome remembered so they are never
+    /// re-sent. Each is kept until the token that made it expires or its
+    /// seat is revoked. At the ceiling, new requests are refused.
+    pub max_uncertain_tickets: usize,
     /// Largest buffered upstream reply keygate will hold and journal.
     pub max_response_bytes: usize,
     pub connect_timeout_ms: u64,
@@ -104,6 +108,7 @@ impl Default for BrokerCfg {
             live_ttl_s: 120,
             retention_s: 900,
             compact_every: 1024,
+            max_uncertain_tickets: crate::journal::DEFAULT_MAX_UNCERTAIN,
             max_response_bytes: 16 << 20,
             connect_timeout_ms: 10_000,
             buffered_timeout_ms: 600_000,
@@ -550,9 +555,10 @@ impl Config {
             || broker.compact_every == 0
             || broker.max_connections == 0
             || broker.max_connections > 1_000_000
+            || broker.max_uncertain_tickets == 0
         {
             return Err(ConfigError::Broker(
-                "retention_s, live_ttl_s and compact_every must be positive; max_connections must be 1..=1000000".to_owned(),
+                "retention_s, live_ttl_s, compact_every and max_uncertain_tickets must be positive; max_connections must be 1..=1000000".to_owned(),
             ));
         }
         if broker.request_read_timeout_ms == 0

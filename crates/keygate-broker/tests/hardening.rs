@@ -255,9 +255,10 @@ async fn tooth_retired_secrets_stay_guarded_until_forgotten() {
         if i == 7 {
             assert_eq!(api(&rig).retired, 8);
             rig.broker.revoke(S, "api", false, OPERATOR).unwrap();
+            // Nothing is evicted: the revoked key joins the eight.
             assert_eq!(
                 (api(&rig).state.as_str(), api(&rig).retired),
-                ("revoked", 8)
+                ("revoked", 9)
             );
             rig.broker.revoke(S, "api", true, OPERATOR).unwrap();
             assert_eq!(api(&rig).retired, 0, "revoke --forget destroys");
@@ -1796,4 +1797,275 @@ async fn tooth_shutdown_cuts_flights_and_records_their_outcomes() {
         rig.stream(S, call(&token, "api", "GET", "/events", b"")).await.unwrap(),
         StreamOutcome::Spent { summary: again, .. } if again == summary
     ));
+}
+
+// ----- follow-up K-P5, K-P6: how long things are remembered ---------------------
+
+/// #tooth (follow-up K-P5): a request of unknown outcome is never re-sent
+/// to an exact retry (same token, same Idempotency-Key, same bytes),
+/// however long after `retention_s` the retry comes and across a restart.
+/// Before: the Uncertain ticket was dropped at `retention_s` like a
+/// completed reply, and the late retry sent the POST a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tooth_uncertain_requests_are_never_resent_however_late_the_retry() {
+    let up = Upstream::start(|seen| {
+        if seen.path.ends_with("/hang") {
+            Reply::Hang
+        } else {
+            Reply::ok(r#"{"done":true}"#)
+        }
+    })
+    .await;
+    let cfg = config(&up.origin)
+        .replace(
+            "retention_s = 600",
+            "retention_s = 1\nmax_uncertain_tickets = 2",
+        )
+        .replace("[broker]", "[broker]\nhttp_listen = \"127.0.0.1:0\"");
+    let rig = Rig::new(&cfg);
+    let token = rig.token("seat-a");
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let serve = |rig: &Rig| {
+        let broker = rig.broker.clone();
+        async move {
+            let listeners = Listeners::bind(&broker).await.unwrap();
+            let addr = listeners.http_addr.unwrap();
+            (addr, tokio::spawn(listeners.run(broker)))
+        }
+    };
+    // One POST: `Ok(status, code)` or `Err` when the client gave up waiting.
+    let post = |addr: std::net::SocketAddr, token: &str, path: &str, key: &str| {
+        let request = http
+            .post(format!("http://{addr}/v1/service/api/repos/{path}"))
+            .bearer_auth(token)
+            .header("idempotency-key", key)
+            .timeout(Duration::from_millis(400))
+            .body(r#"{"transfer":"100 EUR"}"#);
+        async move {
+            let response = request.send().await.map_err(|_| ())?;
+            let status = response.status().as_u16();
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.bytes().await.map_err(|_| ())?)
+                    .unwrap_or_default();
+            Ok::<_, ()>((
+                status,
+                body["error"]["code"].as_str().unwrap_or("").to_owned(),
+            ))
+        }
+    };
+    let (addr, serving) = serve(&rig).await;
+
+    // The caller gives up on a POST the upstream has received.
+    assert!(post(addr, &token, "hang", "key-1").await.is_err());
+    assert_eq!(up.hits(), 1);
+    // The broker notices the hangup asynchronously; then it is Uncertain.
+    let deadline = Instant::now() + WAIT;
+    while rig.broker.status().journal.uncertain == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned call never became Uncertain"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Well past retention_s (1 s), the exact retry is still refused.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        post(addr, &token, "hang", "key-1").await,
+        Ok((409, "uncertain".into()))
+    );
+    assert_eq!(
+        up.hits(),
+        1,
+        "an Uncertain POST was sent again after retention"
+    );
+
+    // The contrast the retention window is for: a *completed* reply is
+    // replayed inside the window and forgotten after it.
+    assert_eq!(
+        post(addr, &token, "ok", "key-2").await,
+        Ok((200, String::new()))
+    );
+    assert_eq!(
+        post(addr, &token, "ok", "key-2").await,
+        Ok((200, String::new()))
+    );
+    assert_eq!(up.hits(), 2, "replayed inside the window");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_eq!(
+        post(addr, &token, "ok", "key-2").await,
+        Ok((200, String::new()))
+    );
+    assert_eq!(
+        up.hits(),
+        3,
+        "after the window a completed request is a new request"
+    );
+
+    // A restart and a compaction do not lose the record either.
+    serving.abort();
+    let _ = serving.await;
+    let rig = rig.reopen(BrokerOptions::default());
+    let (addr, _serving) = serve(&rig).await;
+    assert_eq!(rig.broker.status().journal.uncertain, 1);
+    assert_eq!(
+        post(addr, &token, "hang", "key-1").await,
+        Ok((409, "uncertain".into()))
+    );
+    assert_eq!(up.hits(), 3);
+
+    // A new identity is the caller deliberately sending again: allowed.
+    assert!(post(addr, &token, "hang", "key-1-again").await.is_err());
+    assert_eq!(up.hits(), 4);
+    let deadline = Instant::now() + WAIT;
+    while rig.broker.status().journal.uncertain < 2 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The ledger of such records is bounded (2 here). Full, it refuses
+    // new requests; it does not drop an old record to make room.
+    assert_eq!(
+        post(addr, &token, "ok", "key-3").await,
+        Ok((503, "no_resend_ledger_full".into()))
+    );
+    assert_eq!(
+        post(addr, &token, "hang", "key-1").await,
+        Ok((409, "uncertain".into()))
+    );
+    assert_eq!(up.hits(), 4);
+
+    // Revoking the seat is what makes the records safe to drop: its old
+    // tokens can never retry. That fact is journaled, and room appears.
+    rig.broker.revoke_seat("seat-a", OPERATOR).unwrap();
+    assert_eq!(
+        post(addr, &token, "hang", "key-1").await.map(|r| r.0),
+        Ok(403)
+    );
+    let reminted = rig.token("seat-a");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        post(addr, &reminted, "ok", "key-3").await,
+        Ok((200, String::new()))
+    );
+    assert_eq!(rig.broker.status().journal.uncertain, 0);
+    assert_eq!(up.hits(), 5);
+}
+
+/// #tooth (follow-up K-P6): revoking a row whose retired list is full
+/// forgets nothing. Every earlier key stays withheld, on other rows too
+/// and across a restart, until `forget`. Before: revocation dropped the
+/// oldest retired secret to make room, so an echo of that still-valid key
+/// passed.
+#[tokio::test]
+async fn tooth_revocation_at_capacity_forgets_nothing() {
+    fn key(i: usize) -> String {
+        format!("sk-ring-key-{i:04}-0123456789")
+    }
+    let up = Upstream::start(|seen| match seen.path.strip_prefix("/repos/echo-") {
+        Some(i) => Reply::ok(format!("an old key: {}", key(i.parse().unwrap()))),
+        None => Reply::ok("{}"),
+    })
+    .await;
+    let cfg = format!(
+        "{}\n[services.other]\norigin = \"{}\"\nbuffered_paths = [\"/repos\"]\n",
+        config(&up.origin),
+        up.origin
+    );
+    let rig = Rig::unset(&cfg);
+    rig.set(S, "other", SECRET, false);
+    let token = rig.token("seat-a");
+    let api = |rig: &Rig| {
+        rig.broker
+            .rows()
+            .into_iter()
+            .find(|r| r.namespace == S && r.row == "api")
+            .unwrap()
+    };
+    // The echo arrives on a different row than the one the keys belong to.
+    let echoed = |rig: &Rig, i: usize| {
+        let request = fresh(call(
+            &token,
+            "other",
+            "GET",
+            &format!("/repos/echo-{i}"),
+            b"",
+        ));
+        let broker = rig.broker.clone();
+        async move { broker.forward(S, AGENT, request, HeaderMode::Strict).await }
+    };
+
+    // Nine keys: the ninth is active, the eight before it fill the list.
+    for i in 0..9 {
+        rig.set(S, "api", &key(i), false);
+    }
+    assert_eq!((api(&rig).state.as_str(), api(&rig).retired), ("active", 8));
+
+    // Revoke without forgetting. It succeeds at once and keeps all nine.
+    rig.broker.revoke(S, "api", false, OPERATOR).unwrap();
+    assert_eq!(
+        (api(&rig).state.as_str(), api(&rig).retired),
+        ("revoked", 9)
+    );
+    for i in 0..9 {
+        assert_eq!(
+            code(echoed(&rig, i).await),
+            Code::Withheld,
+            "key {i} was forgotten by revoke"
+        );
+    }
+    // Revoking again changes nothing.
+    rig.broker.revoke(S, "api", false, OPERATOR).unwrap();
+    assert_eq!(api(&rig).retired, 9);
+
+    // Sealed, and still all there after a restart.
+    for i in 0..9 {
+        assert_no_plaintext(rig.state(), &key(i));
+    }
+    let rig = rig.reopen(BrokerOptions::default());
+    assert_eq!(
+        (api(&rig).state.as_str(), api(&rig).retired),
+        ("revoked", 9)
+    );
+    for i in 0..9 {
+        assert_eq!(
+            code(echoed(&rig, i).await),
+            Code::Withheld,
+            "key {i} was lost in the restart"
+        );
+    }
+
+    // A new secret needs the operator to say the old ones may go; until
+    // then the row stays revoked and guarded.
+    let refused = rig
+        .broker
+        .set(S, "api", secret(&key(9)), false, false, OPERATOR)
+        .unwrap_err();
+    assert_eq!(refused.code, Code::BadRequest);
+    assert!(
+        refused.message.contains("keygate forget"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        (api(&rig).state.as_str(), api(&rig).retired),
+        ("revoked", 9)
+    );
+    assert_eq!(code(echoed(&rig, 0).await), Code::Withheld);
+
+    // Only the explicit forget removes patterns.
+    assert_eq!(rig.broker.forget(S, "api", OPERATOR).unwrap(), 9);
+    rig.set(S, "api", &key(9), false);
+    assert_eq!((api(&rig).state.as_str(), api(&rig).retired), ("active", 0));
+    let passed = echoed(&rig, 0).await.unwrap();
+    assert!(contains(&passed.body, key(0).as_bytes()));
+    assert_eq!(
+        code(echoed(&rig, 9).await),
+        Code::Withheld,
+        "the new active key is guarded"
+    );
+    assert_eq!(
+        rig.broker.status().guard_pattern_bytes,
+        guard_cost(key(9).as_bytes()) + guard_cost(SECRET.as_bytes())
+    );
 }

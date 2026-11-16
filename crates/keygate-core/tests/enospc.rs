@@ -36,6 +36,8 @@ fn ticket(n: u32) -> NewTicket {
         reserve_micro_usd: 1,
         now_unix_s: keygate_core::unix_time().unwrap(),
         live_ttl_s: 3600,
+        owner_expires_unix_s: None,
+        root_epoch: 0,
     }
 }
 
@@ -105,7 +107,8 @@ fn inside(dir: &Path) {
         acked.len()
     );
 
-    let check = |journal: &Journal, tickets: usize| {
+    // `records` is how many commits were acknowledged: one line each.
+    let check = |journal: &Journal, tickets: usize, records: usize| {
         assert_eq!(
             journal.poisoned(),
             None,
@@ -119,34 +122,46 @@ fn inside(dir: &Path) {
         );
         let file = std::fs::read(&path).unwrap();
         assert_eq!(file.last(), Some(&b'\n'), "journal ends in a torn record");
-        assert_eq!(file.iter().filter(|&&b| b == b'\n').count(), tickets);
+        assert_eq!(file.iter().filter(|&&b| b == b'\n').count(), records);
     };
-    check(&journal, acked.len());
+    check(&journal, acked.len(), acked.len());
 
-    // Still full: every kind of commit keeps failing, and keeps failing
-    // cleanly.
+    // Still full: opening tickets keeps failing, and keeps failing cleanly.
     let full = std::fs::read(&path).unwrap();
     for attempt in 0..20u32 {
         let err = journal.authorize(ticket(1_000_000 + attempt)).unwrap_err();
         assert!(matches!(&err, JournalError::Io(e) if is_enospc(e)), "{err}");
     }
-    assert!(journal.begin(acked[0]).is_err_and(|e| is_enospc(&e)));
-    assert_eq!(
-        journal.get(acked[0]).unwrap().state,
-        TicketState::Live,
-        "the claim was not acknowledged"
-    );
     assert_eq!(
         std::fs::read(&path).unwrap(),
         full,
         "failed appends left bytes behind"
     );
-    check(&journal, acked.len());
+    // A claim is a shorter record, so a few may still fit in the last
+    // page. Claim tickets until one does not: that one must fail closed.
+    let mut claimed = 0;
+    let refused = loop {
+        assert!(claimed < acked.len(), "the disk never refused a claim");
+        match journal.begin(acked[claimed]) {
+            Ok(Begin::Started) => claimed += 1,
+            Ok(other) => panic!("unexpected claim result: {other:?}"),
+            Err(e) => {
+                assert!(is_enospc(&e), "{e}");
+                break acked[claimed];
+            }
+        }
+    };
+    assert_eq!(
+        journal.get(refused).unwrap().state,
+        TicketState::Live,
+        "the claim was not acknowledged"
+    );
+    check(&journal, acked.len(), acked.len() + claimed);
 
     // Space comes back: the same journal carries on where it left off.
     std::fs::remove_file(&filler).unwrap();
     let (later, _) = journal.authorize(ticket(acked.len() as u32)).unwrap();
-    assert!(matches!(journal.begin(acked[0]).unwrap(), Begin::Started));
+    assert!(matches!(journal.begin(refused).unwrap(), Begin::Started));
     drop(journal);
 
     // And it boots. Before the fix a torn record in mid-file made this
@@ -155,7 +170,7 @@ fn inside(dir: &Path) {
     assert_eq!(journal.stats().tickets, acked.len() + 1);
     assert_eq!(journal.spent("k"), acked.len() as u64 + 1);
     assert_eq!(journal.get(later.id).unwrap().state, TicketState::Live);
-    assert_eq!(journal.get(acked[0]).unwrap().state, TicketState::Uncertain);
+    assert_eq!(journal.get(refused).unwrap().state, TicketState::Uncertain);
     println!(
         "enospc: {} tickets and {written} audit lines fit; all failures were clean",
         acked.len()

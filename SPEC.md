@@ -61,7 +61,7 @@ Goal: an upstream that reflects the injected credential (error page, debug echo,
 
 - **Patterns.** For each guarded secret: the secret, and each of these when it differs: percent-encoding with uppercase and with lowercase hex; JSON escaping of `"` and `\`; the same plus `\/`; the same plus `<`/`>`/`&`.
 - **Match.** Any 16 consecutive bytes of a pattern (the whole pattern if shorter). An echo that drops or alters characters still trips while a 16-byte run survives.
-- **Which secrets.** Every row's active secret, and its *retired* secrets: after `set` or `revoke` the previous secret is kept, sealed, as a guard-only pattern until the operator runs `forget` (at most 8 per row; a ninth rotation is refused until then, a revocation never is). A flight takes its secret and a guard containing that secret as one atomic pair and keeps both until it ends, so forgetting a secret never unguards a flight already sent with it.
+- **Which secrets.** Every row's active secret, and its *retired* secrets: after `set` or `revoke` the previous secret is kept, sealed, as a guard-only pattern until the operator runs `forget` (a row with an active secret keeps at most 8; a rotation that would make it 9 is refused and changes nothing; a revocation is never refused and never drops one: the revoked row holds the 8 plus the secret just revoked, 9, the same secrets it held before). **Only `forget`, `set --forget-retired` and `revoke --forget` remove patterns.** A revoked row at 9 needs `forget` before a new secret can be set. A flight takes its secret and a guard containing that secret as one atomic pair and keeps both until it ends, so forgetting a secret never unguards a flight already sent with it.
 - **Streaming.** The longest suffix of the stream that is a substring of some pattern (at most 15 bytes) is held back; everything before it is forwarded at once. When a window completes, the stream is cut before any byte of that window was forwarded, the upstream request is aborted, and the closing summary says `withheld`.
 - **Head.** Status and headers are scanned whole before a head is emitted. A reply with a `Content-Encoding` other than `identity` is withheld, since it cannot be scanned (keygate requests `identity`).
 - **Bounds.** One suffix automaton over all patterns, sparse tables zeroed on drop, built outside any lock a request takes. Total pattern bytes are capped at 64 KiB; a `set` that would exceed the cap is refused and changes nothing.
@@ -71,10 +71,22 @@ Goal: an upstream that reflects the injected credential (error page, debug echo,
 
 Append-only WAL plus an in-memory `(seat, digest) -> ticket` index; lookups are `O(1)`.
 
-- Exact retry of `authorize` returns the existing ticket and is not charged again. Unused `Live` reservations expire after `live_ttl_s` and are refunded.
-- A buffered reply is retained for `retention_s` and replays on exact retry. A caller that disconnects mid-flight leaves the ticket `Uncertain`, which is never re-sent.
-- A stream ticket retains its closing summary (`status, bytes, complete, withheld, revoked, closed_by`); retrying it reports how it ended.
-- A ticket in flight at a crash comes back `Uncertain` and is retained for the full `retention_s`.
+An *exact retry* is the same token presenting the same request: same row, method, path, query, forwarded headers, body and request id (`Idempotency-Key` on the gateway). A different request id is a different request, and is how a caller deliberately sends again.
+
+How long a ticket is remembered depends on what is known about it:
+
+| state | meaning | remembered for | an exact retry gets |
+|---|---|---|---|
+| `Live` | authorized, never sent | `live_ttl_s` (default 120 s), then refunded | the same ticket, no second charge |
+| `Replayable` | buffered reply received | `retention_s` (default 900 s) | the retained reply; after the window, a new send |
+| `Closed` | stream ended | `retention_s` | its closing summary (`status, bytes, complete, withheld, revoked, closed_by`); after the window, a new stream |
+| `Withheld` | reply contained a guarded secret | `retention_s` | a refusal; after the window, a new send |
+| `Uncertain` | may have reached the upstream; outcome unknown | at least `retention_s`, **and for as long as the token that sent it could retry** | a refusal (`uncertain`), never a send |
+
+- A call becomes `Uncertain` when its caller disconnects mid-flight, the upstream fails after the request may have been sent, it is cut by revocation or shutdown, or the broker crashes with it in flight.
+- An `Uncertain` ticket may be dropped only when its token can no longer present anything: the token's `ExpiresAtUnixS` has passed, or its seat has been revoked past the epoch the token was minted under. The seat's revocation floor is written to the journal itself (and reconciled with the seat file at start), so that decision rests on the journal's own durable record. A token with no expiry on a seat that is never revoked keeps its `Uncertain` tickets indefinitely; they hold no reply body.
+- The number of `Uncertain` tickets is capped by `max_uncertain_tickets` (default 10000). At the cap the broker first drops those whose tokens can no longer retry; if it is still full, every *new* request is refused with `no_resend_ledger_full` (HTTP 503) until tokens expire or seats are revoked. No record is dropped to make room. Exact retries of remembered requests are still answered.
+- The finite window applies only where the outcome is known. After `retention_s` a completed request's reply is gone, and keygate cannot tell a late retry from a new request: it is sent. Callers that need longer deduplication of completed requests must rely on the upstream's own idempotency support.
 - **Write failures.** Each record is appended and `fdatasync`ed before it takes effect in memory. A short write (disk full) is cut back to the last committed byte; that operation fails and the journal stays usable. If the cut-back fails, or `fdatasync` or a compaction's directory sync fails, the journal is poisoned: every later commit is refused until restart, and so is every call. The audit log cuts back torn lines the same way.
 - Audit-before-effect: `Begin` is appended and synced to the `0600` audit log before any upstream I/O; if that fails the call is refused.
 

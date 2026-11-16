@@ -256,6 +256,9 @@ pub enum Code {
     InFlight,
     /// An earlier attempt may have reached the upstream; not re-sent.
     Uncertain,
+    /// Too many requests of unknown outcome are being remembered; no new
+    /// request is accepted until their tokens expire or seats are revoked.
+    NoResendLedgerFull,
     /// The upstream reply contained a guarded secret.
     Withheld,
     AuditFailed,
@@ -276,7 +279,7 @@ impl Code {
         match self {
             Code::BadRequest | Code::PathRefused | Code::HeaderRefused => 400,
             Code::Timeout => 408,
-            Code::ShuttingDown | Code::ClockFailed => 503,
+            Code::ShuttingDown | Code::ClockFailed | Code::NoResendLedgerFull => 503,
             Code::BadToken => 401,
             Code::Denied
             | Code::NotOperator

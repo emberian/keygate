@@ -514,9 +514,11 @@ impl Vault {
             return Err(Refusal::new(
                 Code::BadRequest,
                 format!(
-                    "{ns}/{row} already has {MAX_RETIRED} retired secrets still being withheld \
-                     from responses. Once the old keys are invalid upstream, run `keygate forget \
-                     {ns} {row}` (or `set --forget-retired`); nothing changed"
+                    "{ns}/{row} would have {} retired secrets still being withheld from \
+                     responses; a row with an active secret keeps at most {MAX_RETIRED}. Once \
+                     the old keys are invalid upstream, run `keygate forget {ns} {row}` (or \
+                     `set --forget-retired`); nothing changed",
+                    retired.len()
                 ),
             ));
         }
@@ -550,7 +552,9 @@ impl Vault {
 
     /// Stop using a row's secret. The epoch moves first, in memory, so open
     /// streams are cut before any disk I/O happens. The secret stays as a
-    /// retired guard pattern (sealed) unless `forget`.
+    /// retired guard pattern (sealed) unless `forget`, and no other retired
+    /// pattern is dropped: only `forget` (here or as its own operation)
+    /// removes patterns.
     pub fn revoke(&self, ns: Namespace, row: &str, forget: bool) -> Result<RowEpoch, Refusal> {
         let upstream = self.upstream(ns, row)?;
         let _admin = self
@@ -573,12 +577,17 @@ impl Vault {
             if forget {
                 secrets.retired.clear();
             } else if let Some(revoked) = revoked {
-                // Revocation is never refused for lack of room: the oldest
-                // retired pattern makes way.
-                if secrets.retired.len() >= MAX_RETIRED {
-                    secrets.retired.remove(0);
+                // Revocation is never refused for lack of room and never
+                // forgets anything: the row no longer has an active
+                // secret, so it holds exactly the secrets it held before,
+                // and a revoked row is allowed that one extra retired slot.
+                if !secrets
+                    .retired
+                    .iter()
+                    .any(|r| r.expose() == revoked.expose())
+                {
+                    secrets.retired.push(revoked);
                 }
-                secrets.retired.push(revoked);
             }
             Upstream::sealed(next, &secrets)
         };
@@ -598,7 +607,7 @@ impl Vault {
                 .and_then(std::fs::remove_file);
             return Err(Refusal::new(
                 Code::Internal,
-                format!("{ns}/{row} is revoked in memory, but writing the tombstone failed ({e}); removing the sealed file: {removed:?}"),
+                format!("{ns}/{row} is revoked in memory and its retired secrets stay guarded until restart, but writing the tombstone failed ({e}). The sealed file was removed so the revoked secret cannot come back ({removed:?}); with it went the sealed copy of the retired secrets"),
             ));
         }
         Ok(next)

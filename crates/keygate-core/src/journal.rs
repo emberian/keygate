@@ -8,6 +8,25 @@
 //! was in flight at the crash comes back `Uncertain`: its request may have
 //! reached the upstream, so it is never sent again.
 //!
+//! # How long a ticket is remembered
+//!
+//! - `Live` (never sent): `live_ttl_s`, then refunded and forgotten.
+//! - `Replayable`, `Withheld`, `Closed` (the outcome is known):
+//!   `retention_s`. After that the reply is gone and an identical request
+//!   is a new request.
+//! - `Uncertain` (it may have reached the upstream, and nobody knows): at
+//!   least `retention_s`, and beyond that for as long as the token that
+//!   opened it could still present the same request. That ends when the
+//!   token's own expiry passes or its seat is revoked; the seat's
+//!   revocation floor is journaled here so the decision does not rest on
+//!   another file. Until then an exact retry finds the ticket and is
+//!   refused, however much time has passed.
+//!
+//! `Uncertain` tickets are small (no reply body) but a token without an
+//! expiry keeps its own forever, so their number is capped. At the cap new
+//! tickets are refused, which stops new sends, rather than an old
+//! no-resend record being dropped.
+//!
 //! Write failures never leave the file unparseable or the memory ahead of
 //! the disk. A short write (`ENOSPC`) is cut back to the last committed
 //! byte and only that operation fails. If the cut-back fails, or `fdatasync`
@@ -161,7 +180,18 @@ pub struct Ticket {
     /// Ledger keys this ticket's reservation was charged to.
     pub ledger_keys: Vec<String>,
     pub reserved_micro_usd: u64,
+    /// When the token that opened this ticket stops being valid, if it
+    /// ever does. A ticket written before this field existed reads as
+    /// `None`: never, the safe direction.
+    #[serde(default)]
+    pub owner_expires_unix_s: Option<u64>,
+    /// The seat epoch that token was minted under.
+    #[serde(default)]
+    pub root_epoch: u64,
 }
+
+/// Default ceiling on `Uncertain` tickets held at once.
+pub const DEFAULT_MAX_UNCERTAIN: usize = 10_000;
 
 /// A ledger key to charge, with the ceiling it must stay under (if any).
 #[derive(Clone, Debug)]
@@ -180,6 +210,10 @@ pub struct NewTicket {
     pub reserve_micro_usd: u64,
     pub now_unix_s: u64,
     pub live_ttl_s: u64,
+    /// The opening token's earliest `ExpiresAtUnixS`, if any.
+    pub owner_expires_unix_s: Option<u64>,
+    /// The seat epoch the opening token was minted under.
+    pub root_epoch: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -197,6 +231,12 @@ pub enum JournalError {
     Corrupt { line: usize, problem: String },
     #[error(transparent)]
     Clock(#[from] crate::ClockError),
+    #[error(
+        "{held} requests of unknown outcome are being remembered so they are never re-sent \
+         (limit {cap}). They clear when the tokens that made them expire or their seats are \
+         revoked; until then no new request is accepted"
+    )]
+    UncertainFull { held: usize, cap: usize },
 }
 
 /// Fault injection for the journal's storage calls. Production brokers
@@ -263,6 +303,9 @@ enum Rec {
     Expire { id: TicketId },
     /// Ledger total carried over by compaction.
     Ledger { key: String, total: u64 },
+    /// Tokens of `seat` minted under an epoch below `epoch` are revoked
+    /// and can never present a request again.
+    SeatFloor { seat: SeatId, epoch: u64 },
 }
 
 #[derive(Clone, Default)]
@@ -272,6 +315,10 @@ struct State {
     ledger: HashMap<String, u64>,
     // Expiry index avoids scanning every retained reply on each admission.
     live_expiries: BTreeSet<(u64, TicketId)>,
+    /// Revocation floor per seat.
+    seat_floors: HashMap<SeatId, u64>,
+    /// How many tickets are `Uncertain`.
+    uncertain: usize,
 }
 
 impl State {
@@ -295,6 +342,8 @@ impl State {
                     if state == TicketState::Live {
                         self.live_expiries.insert((expires_unix_s, id));
                     }
+                    self.uncertain -= usize::from(ticket.state == TicketState::Uncertain);
+                    self.uncertain += usize::from(state == TicketState::Uncertain);
                     ticket.state = state;
                     ticket.expires_unix_s = expires_unix_s;
                 }
@@ -316,6 +365,7 @@ impl State {
             Rec::Expire { id } => {
                 if let Some(ticket) = self.tickets.remove(&id) {
                     self.live_expiries.remove(&(ticket.expires_unix_s, id));
+                    self.uncertain -= usize::from(ticket.state == TicketState::Uncertain);
                     let slot = (ticket.seat, ticket.digest);
                     if self.index.get(&slot) == Some(&id) {
                         self.index.remove(&slot);
@@ -332,10 +382,35 @@ impl State {
             Rec::Ledger { key, total } => {
                 self.ledger.insert(key, total);
             }
+            Rec::SeatFloor { seat, epoch } => {
+                let floor = self.seat_floors.entry(seat).or_default();
+                *floor = (*floor).max(epoch);
+            }
+        }
+    }
+
+    /// Could the token that opened `ticket` still present a request?
+    fn owner_can_retry(&self, ticket: &Ticket, now_unix_s: u64) -> bool {
+        let unexpired = ticket.owner_expires_unix_s.is_none_or_later(now_unix_s);
+        let unrevoked =
+            self.seat_floors.get(&ticket.seat).copied().unwrap_or(0) <= ticket.root_epoch;
+        unexpired && unrevoked
+    }
+
+    /// May `ticket` be forgotten at `now`? Never while in flight; never
+    /// before its retention deadline; and an `Uncertain` ticket not while
+    /// its owner could retry the same request.
+    fn forgettable(&self, ticket: &Ticket, now_unix_s: u64) -> bool {
+        match ticket.state {
+            TicketState::InFlight => false,
+            _ if ticket.expires_unix_s > now_unix_s => false,
+            TicketState::Uncertain => !self.owner_can_retry(ticket, now_unix_s),
+            _ => true,
         }
     }
 
     fn insert(&mut self, ticket: Ticket) {
+        self.uncertain += usize::from(ticket.state == TicketState::Uncertain);
         if ticket.state == TicketState::Live {
             self.live_expiries
                 .insert((ticket.expires_unix_s, ticket.id));
@@ -343,6 +418,19 @@ impl State {
         self.index
             .insert((ticket.seat.clone(), ticket.digest), ticket.id);
         self.tickets.insert(ticket.id, ticket);
+    }
+}
+
+trait ExpiryExt {
+    fn is_none_or_later(&self, now_unix_s: u64) -> bool;
+}
+
+impl ExpiryExt for Option<u64> {
+    fn is_none_or_later(&self, now_unix_s: u64) -> bool {
+        match self {
+            None => true,
+            Some(at) => now_unix_s < *at,
+        }
     }
 }
 
@@ -357,6 +445,7 @@ struct Inner {
     state: State,
     appended: u64,
     compact_every: u64,
+    max_uncertain: usize,
 }
 
 pub struct Journal {
@@ -368,7 +457,7 @@ pub struct Journal {
 pub enum Begin {
     Started,
     /// The ticket was not `Live`; here is what it is instead.
-    NotLive(Ticket),
+    NotLive(Box<Ticket>),
     Missing,
 }
 
@@ -377,6 +466,9 @@ pub struct JournalStats {
     pub tickets: usize,
     pub ledger_keys: usize,
     pub appended_since_compaction: u64,
+    /// Requests of unknown outcome being remembered so they are not re-sent.
+    #[serde(default)]
+    pub uncertain: usize,
     /// Commits are being refused after a storage failure; restart needed.
     #[serde(default)]
     pub poisoned: bool,
@@ -458,6 +550,7 @@ impl Journal {
             state,
             appended,
             compact_every: compact_every.max(1),
+            max_uncertain: DEFAULT_MAX_UNCERTAIN,
         };
 
         let stranded: Vec<TicketId> = inner
@@ -500,10 +593,33 @@ impl Journal {
         let slot = (new.seat, new.digest);
         if let Some(&id) = inner.state.index.get(&slot) {
             let ticket = &inner.state.tickets[&id];
-            if ticket.state == TicketState::InFlight || ticket.expires_unix_s > new.now_unix_s {
+            if !inner.state.forgettable(ticket, new.now_unix_s) {
                 return Ok((ticket.clone(), true));
             }
             inner.commit(Rec::Expire { id })?;
+        }
+        // A new ticket is a possible new send, and a send can end
+        // Uncertain. With the no-resend ledger full, first drop the records
+        // nobody can retry any more; if it is still full, refuse.
+        if inner.state.uncertain >= inner.max_uncertain {
+            let stale: Vec<TicketId> = inner
+                .state
+                .tickets
+                .values()
+                .filter(|t| {
+                    t.state == TicketState::Uncertain && inner.state.forgettable(t, new.now_unix_s)
+                })
+                .map(|t| t.id)
+                .collect();
+            for id in stale {
+                inner.commit(Rec::Expire { id })?;
+            }
+            if inner.state.uncertain >= inner.max_uncertain {
+                return Err(JournalError::UncertainFull {
+                    held: inner.state.uncertain,
+                    cap: inner.max_uncertain,
+                });
+            }
         }
         if new.reserve_micro_usd > 0 {
             for charge in &new.charges {
@@ -536,6 +652,8 @@ impl Journal {
                 Vec::new()
             },
             reserved_micro_usd: new.reserve_micro_usd,
+            owner_expires_unix_s: new.owner_expires_unix_s,
+            root_epoch: new.root_epoch,
         };
         inner.commit(Rec::Open(ticket.clone()))?;
         Ok((ticket, false))
@@ -548,7 +666,7 @@ impl Journal {
             return Ok(Begin::Missing);
         };
         if ticket.state != TicketState::Live {
-            return Ok(Begin::NotLive(ticket.clone()));
+            return Ok(Begin::NotLive(Box::new(ticket.clone())));
         }
         let expires_unix_s = ticket.expires_unix_s;
         inner.commit(Rec::State {
@@ -595,8 +713,34 @@ impl Journal {
             tickets: inner.state.tickets.len(),
             ledger_keys: inner.state.ledger.len(),
             appended_since_compaction: inner.appended,
+            uncertain: inner.state.uncertain,
             poisoned: inner.poisoned.is_some(),
         }
+    }
+
+    /// Set the ceiling on `Uncertain` tickets (at least 1).
+    pub fn set_max_uncertain(&self, cap: usize) {
+        self.lock().max_uncertain = cap.max(1);
+    }
+
+    /// Durably record that every token of `seat` minted under an epoch
+    /// below `epoch` is revoked. `Uncertain` tickets those tokens opened
+    /// become forgettable once past their retention deadline.
+    pub fn revoke_seat(&self, seat: &str, epoch: u64) -> io::Result<()> {
+        self.lock().commit(Rec::SeatFloor {
+            seat: seat.to_owned(),
+            epoch,
+        })
+    }
+
+    /// The journaled revocation floor of `seat` (0 if never revoked).
+    pub fn seat_floor(&self, seat: &str) -> u64 {
+        self.lock()
+            .state
+            .seat_floors
+            .get(seat)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Why commits are being refused, if they are.
@@ -708,7 +852,7 @@ impl Inner {
         let expired: Vec<TicketId> = snapshot
             .tickets
             .values()
-            .filter(|t| t.state != TicketState::InFlight && t.expires_unix_s <= now_unix_s)
+            .filter(|t| snapshot.forgettable(t, now_unix_s))
             .map(|t| t.id)
             .collect();
         for id in expired {
@@ -739,6 +883,16 @@ impl Inner {
         }
         for ticket in snapshot.tickets.values() {
             serde_json::to_writer(&mut out, &Rec::Snap(ticket.clone()))?;
+            out.write_all(b"\n")?;
+        }
+        for (seat, epoch) in &snapshot.seat_floors {
+            serde_json::to_writer(
+                &mut out,
+                &Rec::SeatFloor {
+                    seat: seat.clone(),
+                    epoch: *epoch,
+                },
+            )?;
             out.write_all(b"\n")?;
         }
         let file = out.into_inner().map_err(|e| e.into_error())?;
@@ -787,6 +941,8 @@ mod tests {
             reserve_micro_usd: reserve,
             now_unix_s: NOW,
             live_ttl_s: 60,
+            owner_expires_unix_s: None,
+            root_epoch: 0,
         }
     }
 
@@ -986,7 +1142,8 @@ mod tests {
             .0
             .id;
         j.begin(gone).unwrap();
-        j.transition(gone, TicketState::Uncertain, NOW + 10)
+        // A known outcome with no reply to keep: forgettable at its deadline.
+        j.transition(gone, TicketState::Withheld { status: 500 }, NOW + 10)
             .unwrap();
         let stale_day = row_day_key("llm", utc_day(NOW) - 5);
         j.authorize(new("a", 3, 5, capped(&stale_day, 100)))
@@ -1288,5 +1445,129 @@ mod tests {
         j.authorize(new("a", 3, 10, capped("k", 100))).unwrap();
         drop(j);
         assert_eq!(journal(dir.path()).spent("k"), 30);
+    }
+
+    /// Open a ticket and leave it `Uncertain`, retained until `NOW + 60`.
+    fn uncertain(j: &Journal, digest: u8, owner_expires: Option<u64>, root_epoch: u64) -> TicketId {
+        let mut n = new("seat", digest, 0, vec![]);
+        n.owner_expires_unix_s = owner_expires;
+        n.root_epoch = root_epoch;
+        let id = j.authorize(n).unwrap().0.id;
+        j.begin(id).unwrap();
+        j.transition(id, TicketState::Uncertain, NOW + 60).unwrap();
+        id
+    }
+
+    fn retry(j: &Journal, digest: u8, at: u64) -> Result<(Ticket, bool), JournalError> {
+        let mut n = new("seat", digest, 0, vec![]);
+        n.now_unix_s = at;
+        j.authorize(n)
+    }
+
+    /// #tooth (follow-up K-P5): an `Uncertain` ticket outlives
+    /// `retention_s` for as long as its owner could retry. Before: it was
+    /// dropped at the retention deadline like a completed reply, and the
+    /// exact retry that followed opened a fresh ticket and re-sent a
+    /// request whose first attempt may have landed.
+    #[test]
+    fn tooth_uncertain_tickets_outlive_retention_while_their_owner_can_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let j = journal(dir.path());
+        let forever = uncertain(&j, 1, None, 0);
+        let until_500 = uncertain(&j, 2, Some(NOW + 500), 0);
+        let old_epoch = uncertain(&j, 3, None, 4);
+        // The contrast: a completed reply is kept for retention only.
+        let done = j.authorize(new("seat", 9, 0, vec![])).unwrap().0.id;
+        j.begin(done).unwrap();
+        j.transition(done, reply(), NOW + 60).unwrap();
+        assert_eq!(j.stats().uncertain, 3);
+
+        // Long after retention, by lookup and across a compaction.
+        let late = NOW + 400;
+        j.compact(late).unwrap();
+        for (digest, id) in [(1, forever), (2, until_500), (3, old_epoch)] {
+            let (found, existing) = retry(&j, digest, late).unwrap();
+            assert!(
+                existing,
+                "digest {digest}: an exact retry got a fresh ticket"
+            );
+            assert_eq!((found.id, found.state), (id, TicketState::Uncertain));
+        }
+        assert!(
+            j.get(done).is_none(),
+            "a known outcome is not kept past retention"
+        );
+        let (fresh, existing) = retry(&j, 9, late).unwrap();
+        assert!(!existing && fresh.id != done);
+
+        // The owner's token expires: its record may go, the others stay.
+        let later = NOW + 500;
+        let (after_expiry, existing) = retry(&j, 2, later).unwrap();
+        assert!(!existing && after_expiry.id != until_500);
+        assert!(retry(&j, 1, later).unwrap().1);
+        assert_eq!(j.stats().uncertain, 2);
+
+        // The seat is revoked past one token's epoch but not the other's
+        // (a token minted at epoch 5 is still valid under floor 5).
+        j.revoke_seat("seat", 4).unwrap();
+        assert!(
+            retry(&j, 3, later).unwrap().1,
+            "epoch 4 is not below floor 4"
+        );
+        j.revoke_seat("seat", 5).unwrap();
+        j.revoke_seat("seat", 2).unwrap();
+        let (after_revocation, existing) = retry(&j, 3, later).unwrap();
+        assert!(!existing && after_revocation.id != old_epoch);
+        // `forever` was minted at epoch 0, below the floor too.
+        j.compact(later).unwrap();
+        assert!(j.get(forever).is_none());
+        assert_eq!(j.stats().uncertain, 0);
+        drop(j);
+
+        // Both the record and the floor are durable.
+        let j = journal(dir.path());
+        let kept = uncertain(&j, 7, None, 5);
+        let dropped = uncertain(&j, 8, None, 4);
+        drop(j);
+        let j = Journal::open(&path, 1_000_000, 60).unwrap();
+        j.compact(NOW + 10_000).unwrap();
+        drop(j);
+        let j = Journal::open(&path, 1_000_000, 60).unwrap();
+        assert_eq!(j.get(kept).unwrap().state, TicketState::Uncertain);
+        assert!(
+            j.get(dropped).is_none(),
+            "the seat floor survived restart and compaction"
+        );
+        assert!(retry(&j, 7, NOW + 1_000_000).unwrap().1);
+    }
+
+    /// #tooth (follow-up K-P5): the no-resend ledger is bounded, and at its
+    /// bound new requests are refused rather than an old record dropped.
+    #[test]
+    fn tooth_uncertain_capacity_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = journal(dir.path());
+        j.set_max_uncertain(2);
+        let first = uncertain(&j, 1, None, 0);
+        let second = uncertain(&j, 2, Some(NOW + 100), 0);
+        let late = NOW + 90;
+
+        let err = retry(&j, 3, late).unwrap_err();
+        assert!(
+            matches!(err, JournalError::UncertainFull { held: 2, cap: 2 }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("never re-sent"));
+        assert_eq!(j.stats().tickets, 2, "a refused request leaves no ticket");
+        // Exact retries of the remembered requests are still answered.
+        assert!(retry(&j, 1, late).unwrap().1 && retry(&j, 2, late).unwrap().1);
+
+        // Room appears only when a record's owner can no longer retry.
+        let (fresh, existing) = retry(&j, 3, NOW + 100).unwrap();
+        assert!(!existing);
+        assert!(j.get(second).is_none() && j.get(first).is_some());
+        assert_eq!(j.get(fresh.id).unwrap().state, TicketState::Live);
+        assert_eq!(j.stats().uncertain, 1);
     }
 }
