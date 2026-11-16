@@ -18,7 +18,7 @@ pub mod secret;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The two credential tables. They share no rows, no directory and no
 /// sealing AAD: a row named `x` may exist in both and they are unrelated.
@@ -79,18 +79,37 @@ pub fn valid_name(s: &str) -> bool {
         && s != ".."
 }
 
-pub fn now_unix_s() -> u64 {
-    SystemTime::now()
+/// Clocks earlier than this (2025-06-15) are treated as broken. A clock
+/// that has fallen back to the epoch would otherwise make every expiry
+/// caveat pass and reset every daily budget.
+pub const MIN_PLAUSIBLE_UNIX_S: u64 = 1_750_000_000;
+
+/// The system clock cannot be used to evaluate expiries or budgets.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("system clock is unusable ({0}); refusing to evaluate expiries or budgets")]
+pub struct ClockError(pub String);
+
+/// Interpret a wall-clock reading. There is no fallback value: callers
+/// fail closed on `Err`.
+pub fn clock_from(now: SystemTime) -> Result<Duration, ClockError> {
+    let since = now
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_err(|_| ClockError("it reads before 1970".to_owned()))?;
+    if since.as_secs() < MIN_PLAUSIBLE_UNIX_S {
+        return Err(ClockError(format!(
+            "it reads {} s since the epoch, before this build existed",
+            since.as_secs()
+        )));
+    }
+    Ok(since)
 }
 
-pub fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+pub fn unix_time() -> Result<u64, ClockError> {
+    clock_from(SystemTime::now()).map(|d| d.as_secs())
+}
+
+pub fn unix_time_ms() -> Result<u64, ClockError> {
+    clock_from(SystemTime::now()).map(|d| d.as_millis() as u64)
 }
 
 /// Fill `buf` from the OS CSPRNG.
@@ -145,6 +164,18 @@ mod tests {
         for bad in ["", ".", "..", "-x", "a/b", "a b", "a:b", &"x".repeat(65)] {
             assert!(!valid_name(bad), "{bad}");
         }
+    }
+
+    /// #tooth: a clock before the epoch or before this build is an error,
+    /// never a zero that would make every expiry pass.
+    #[test]
+    fn tooth_broken_clocks_fail_closed() {
+        assert!(clock_from(UNIX_EPOCH - Duration::from_secs(1)).is_err());
+        assert!(clock_from(UNIX_EPOCH).is_err());
+        assert!(clock_from(UNIX_EPOCH + Duration::from_secs(MIN_PLAUSIBLE_UNIX_S - 1)).is_err());
+        let ok = clock_from(UNIX_EPOCH + Duration::from_secs(MIN_PLAUSIBLE_UNIX_S)).unwrap();
+        assert_eq!(ok.as_secs(), MIN_PLAUSIBLE_UNIX_S);
+        assert!(unix_time().unwrap() >= MIN_PLAUSIBLE_UNIX_S);
     }
 
     #[test]

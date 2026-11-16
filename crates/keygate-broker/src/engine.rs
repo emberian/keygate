@@ -3,32 +3,36 @@
 //!
 //! Order of operations for every call, none of which may be reordered:
 //!
+//! 0. (transports) verify the macaroon and the route before reading a body;
 //! 1. verify the macaroon and admit the request against row policy and caveats;
 //! 2. find or open the ticket (reserving budget) in the journal;
 //! 3. claim the ticket `Live -> InFlight` (durable);
 //! 4. append `Begin` to the audit log (durable) and stop here if that fails;
 //! 5. only now touch the network.
 
-use crate::vault::{ActiveSecret, ProviderRow, RowEpoch, Upstream, Vault};
+use crate::provider::{
+    admit_provider, metered_cost, stream_requested, ProviderAdmission, UsageSniffer,
+};
+use crate::vault::{ActiveSecret, Prices, RowEpoch, Upstream, Vault};
 use crate::BootError;
 use bytes::Bytes;
 use keygate_core::audit::{AuditEvent, AuditLog};
-use keygate_core::config::{BrokerCfg, Config, RESERVED_HEADERS};
+use keygate_core::config::{header_is_reserved, BrokerCfg, Config, Deployment};
 use keygate_core::echo::{EchoAutomaton, EchoGuard};
 use keygate_core::journal::{
-    self, Begin, CallKind, Charge, ClosedBy, Journal, JournalError, NewTicket, RequestDigest32,
-    Retained, StreamSummary, Ticket, TicketId, TicketState,
+    self, Begin, CallKind, Charge, ClosedBy, Journal, JournalError, JournalFaults, NewTicket,
+    RequestDigest32, Retained, StreamSummary, Ticket, TicketId, TicketState,
 };
-use keygate_core::macaroon::{self, Caveat, Facts, MacaroonV1, RootId};
+use keygate_core::macaroon::{self, Caveat, Facts, MacaroonV1, RootId, Verified, TOKEN_PREFIX};
 use keygate_core::path::{check_query, PlainPath};
 use keygate_core::proto::{Call, Code, Refusal, RowInfo, StatusInfo};
 use keygate_core::seal::{write_atomic, MasterKey, SealStore};
 use keygate_core::secret::SecretBytes;
-use keygate_core::{now_unix_s, valid_name, Namespace};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING};
-use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
-use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
+use keygate_core::{unix_time, valid_name, Namespace};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING,
+};
+use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -112,6 +116,9 @@ pub enum StreamOutcome {
 pub struct BrokerOptions {
     /// Use this audit log instead of opening `<state>/audit.log`.
     pub audit: Option<AuditLog>,
+    /// Storage fault injection for the ticket journal (tests only).
+    #[doc(hidden)]
+    pub journal_faults: Option<Arc<JournalFaults>>,
 }
 
 struct Inner {
@@ -123,9 +130,15 @@ struct Inner {
     http: reqwest::Client,
     root_key: SecretBytes,
     operator_uids: Vec<u32>,
+    /// The uid this process runs as: the uid that can read the master key.
+    broker_uid: u32,
     seats: watch::Sender<Arc<BTreeMap<String, u64>>>,
     seat_admin: Mutex<()>,
     disk_slots: Arc<Semaphore>,
+    /// Flips to `true` once; every flight and stream watches it.
+    shutdown: watch::Sender<bool>,
+    /// Calls between a claimed ticket and its recorded outcome.
+    flights: watch::Sender<usize>,
     started: Instant,
 }
 
@@ -154,18 +167,89 @@ struct Prepared {
     reserve_micro_usd: u64,
     charges: Vec<Charge>,
     /// Token prices, present when the reply's usage should settle the reservation.
-    prices: Option<(u64, u64)>,
+    prices: Option<Prices>,
+    /// The token's earliest `ExpiresAtUnixS`, and the clock reading it was
+    /// admitted against.
+    expires_at_unix_s: Option<u64>,
+    admitted_unix_s: u64,
 }
 
 /// A claimed ticket with its `Begin` audited: the network may now be used.
 struct Flight {
     guard: FlightGuard,
     secret: Arc<ActiveSecret>,
+    watch: CutWatch,
+    automaton: Arc<EchoAutomaton>,
+}
+
+/// Why an exchange in progress must stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// The row's secret or the token's seat was revoked.
+    Revoked,
+    /// The token's expiry passed (streams only).
+    Expired,
+    /// The broker is shutting down.
+    Shutdown,
+}
+
+/// Everything that can cut a flight short. Waiting on it is pure in-memory
+/// notification plus, for a stream with an expiring token, one timer; it
+/// never polls and never touches disk.
+struct CutWatch {
     epoch: watch::Receiver<RowEpoch>,
-    seat_epoch: watch::Receiver<Arc<BTreeMap<String, u64>>>,
+    generation: u64,
+    seats: watch::Receiver<Arc<BTreeMap<String, u64>>>,
     seat: String,
     root_epoch: u64,
-    automaton: Arc<EchoAutomaton>,
+    shutdown: watch::Receiver<bool>,
+    expires: Option<tokio::time::Instant>,
+}
+
+impl CutWatch {
+    async fn cut(&mut self) -> Cut {
+        loop {
+            if self.epoch.borrow_and_update().revoked_floor > self.generation
+                || self
+                    .seats
+                    .borrow_and_update()
+                    .get(&self.seat)
+                    .copied()
+                    .unwrap_or(0)
+                    > self.root_epoch
+            {
+                return Cut::Revoked;
+            }
+            if *self.shutdown.borrow_and_update() {
+                return Cut::Shutdown;
+            }
+            let expiry = async {
+                match self.expires {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                // A dropped sender means the broker itself is going away.
+                result = self.epoch.changed() => if result.is_err() { return Cut::Shutdown; },
+                result = self.seats.changed() => if result.is_err() { return Cut::Shutdown; },
+                result = self.shutdown.changed() => if result.is_err() { return Cut::Shutdown; },
+                _ = expiry => return Cut::Expired,
+            }
+        }
+    }
+}
+
+/// Decrements the in-flight count when the flight's outcome is on disk.
+struct InFlight(Broker);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0
+            .inner
+            .flights
+            .send_modify(|n| *n = n.saturating_sub(1));
+    }
 }
 
 /// Owns an `InFlight` ticket. If it is dropped without an explicit outcome
@@ -175,6 +259,7 @@ struct FlightGuard {
     broker: Broker,
     id: TicketId,
     armed: bool,
+    counted: Option<InFlight>,
 }
 
 impl FlightGuard {
@@ -194,6 +279,7 @@ impl Drop for FlightGuard {
         if self.armed {
             let broker = self.broker.clone();
             let id = self.id;
+            let counted = self.counted.take();
             // Cancellation must never block a relay worker. Until this durable
             // cleanup runs the ticket stays InFlight and cannot be re-sent.
             tokio::spawn(async move {
@@ -208,6 +294,7 @@ impl Drop for FlightGuard {
                         });
                     })
                     .await;
+                drop(counted);
             });
         }
     }
@@ -221,7 +308,7 @@ enum ExchangeError {
     Withheld {
         status: u16,
     },
-    Revoked,
+    Cut(Cut),
 }
 
 impl Broker {
@@ -232,6 +319,9 @@ impl Broker {
             .recursive(true)
             .mode(0o700)
             .create(state_dir)?;
+        // The directory may have existed already, with a wider mode.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))?;
         MasterKey::generate(&state_dir.join(MASTER_KEY_FILE))?;
         Ok(())
     }
@@ -242,12 +332,17 @@ impl Broker {
         options: BrokerOptions,
     ) -> Result<Self, BootError> {
         config.validate()?;
+        let broker_uid = crate::harden::effective_uid();
+        // From here on only the canonical path is used: it is the one whose
+        // every ancestor was just checked.
+        let state_dir = &crate::harden::check_state_dir(state_dir, broker_uid)?;
         let master = MasterKey::load(&state_dir.join(MASTER_KEY_FILE))?;
         let vault = Vault::open(&config, SealStore::new(state_dir, &master))?;
-        let journal = Journal::open(
+        let journal = Journal::open_with_faults(
             &state_dir.join(JOURNAL_FILE),
             config.broker.compact_every,
             config.broker.retention_s,
+            options.journal_faults,
         )?;
         let audit = match options.audit {
             Some(audit) => audit,
@@ -259,6 +354,8 @@ impl Broker {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e.into()),
         };
+        // `validate` guarantees a separated deployment lists its operators;
+        // only a development broker falls back to the state dir's owner.
         let operator_uids = if config.broker.operator_uids.is_empty() {
             vec![std::fs::metadata(state_dir)?.uid()]
         } else {
@@ -284,9 +381,12 @@ impl Broker {
                 http,
                 root_key: master.derive(macaroon::ROOT_KEY_CONTEXT),
                 operator_uids,
+                broker_uid,
                 seats: watch::Sender::new(Arc::new(seats)),
                 seat_admin: Mutex::new(()),
                 disk_slots: Arc::new(Semaphore::new(16)),
+                shutdown: watch::Sender::new(false),
+                flights: watch::Sender::new(0),
                 started: Instant::now(),
             }),
         })
@@ -349,16 +449,39 @@ impl Broker {
         self.inner.seats.borrow().get(seat).copied().unwrap_or(0)
     }
 
-    fn retention_deadline(&self) -> u64 {
-        now_unix_s().saturating_add(self.inner.cfg.retention_s)
+    pub fn deployment(&self) -> Deployment {
+        self.inner.cfg.deployment
+    }
+
+    /// The deployment as it is named on the wire.
+    pub fn status_deployment(&self) -> &'static str {
+        deployment_name(self.inner.cfg.deployment)
+    }
+
+    /// May a peer with this uid make calls? In a separated deployment a
+    /// peer running as the broker's own uid is refused: it could read the
+    /// master key directly, so serving it would only disguise a deployment
+    /// with no boundary at all.
+    pub fn may_call(&self, uid: Option<u32>) -> bool {
+        self.inner.cfg.deployment == Deployment::Development || uid != Some(self.inner.broker_uid)
+    }
+
+    /// The wall clock, or a refusal. There is no fallback reading: with no
+    /// clock, expiries and daily budgets cannot be evaluated.
+    fn now(&self) -> Result<u64, Refusal> {
+        unix_time().map_err(|e| Refusal::new(Code::ClockFailed, e.to_string()))
     }
 
     fn record(&self, id: TicketId, state: TicketState) -> Result<(), Refusal> {
-        let deadline = if state == TicketState::Live {
-            now_unix_s().saturating_add(self.inner.cfg.live_ttl_s)
+        // An outcome must be recorded even if the clock has just broken;
+        // then the ticket is simply kept until a compaction with a working
+        // clock, which errs on the side of never re-sending.
+        let ttl = if state == TicketState::Live {
+            self.inner.cfg.live_ttl_s
         } else {
-            self.retention_deadline()
+            self.inner.cfg.retention_s
         };
+        let deadline = unix_time().map_or(u64::MAX, |now| now.saturating_add(ttl));
         self.inner
             .journal
             .transition(id, state, deadline)
@@ -438,20 +561,23 @@ impl Broker {
         Ok(token.encode())
     }
 
-    /// Load or rotate a row's secret (audited first; fails closed).
+    /// Load or rotate a row's secret (audited first; fails closed). The
+    /// previous secret stays a retired guard pattern unless `forget_retired`.
     pub fn set(
         &self,
         ns: Namespace,
         row: &str,
         secret: SecretBytes,
         cut_existing: bool,
+        forget_retired: bool,
         by: Caller,
     ) -> Result<RowEpoch, Refusal> {
         self.inner.vault.upstream(ns, row)?;
-        let detail = if cut_existing {
-            "cut-existing"
-        } else {
-            "rotate"
+        let detail = match (cut_existing, forget_retired) {
+            (true, true) => "cut-existing, forget-retired",
+            (true, false) => "cut-existing",
+            (false, true) => "rotate, forget-retired",
+            (false, false) => "rotate",
         };
         self.inner
             .audit
@@ -463,14 +589,23 @@ impl Broker {
                 detail,
             })
             .map_err(audit_refusal)?;
-        self.inner.vault.set(ns, row, secret, cut_existing)
+        self.inner
+            .vault
+            .set(ns, row, secret, cut_existing, forget_retired)
     }
 
-    /// Destroy a row's secret and cut its streams. Revocation is the one
+    /// Stop using a row's secret and cut its streams. Revocation is the one
     /// effect that happens *before* its audit record: failing to log must
-    /// not keep a compromised key alive.
-    pub fn revoke(&self, ns: Namespace, row: &str, by: Caller) -> Result<RowEpoch, Refusal> {
-        let epoch = self.inner.vault.revoke(ns, row)?;
+    /// not keep a compromised key alive. The secret is kept sealed as a
+    /// retired guard pattern unless `forget`.
+    pub fn revoke(
+        &self,
+        ns: Namespace,
+        row: &str,
+        forget: bool,
+        by: Caller,
+    ) -> Result<RowEpoch, Refusal> {
+        let epoch = self.inner.vault.revoke(ns, row, forget)?;
         self.inner
             .audit
             .append(&AuditEvent::Admin {
@@ -478,7 +613,7 @@ impl Broker {
                 uid: by.uid,
                 namespace: Some(ns),
                 target: row,
-                detail: "",
+                detail: if forget { "forget" } else { "" },
             })
             .map_err(|e| {
                 Refusal::new(
@@ -487,6 +622,23 @@ impl Broker {
                 )
             })?;
         Ok(epoch)
+    }
+
+    /// Drop a row's retired secrets (audited first; fails closed). Returns
+    /// how many were dropped.
+    pub fn forget(&self, ns: Namespace, row: &str, by: Caller) -> Result<usize, Refusal> {
+        self.inner.vault.upstream(ns, row)?;
+        self.inner
+            .audit
+            .append(&AuditEvent::Admin {
+                action: "forget",
+                uid: by.uid,
+                namespace: Some(ns),
+                target: row,
+                detail: "",
+            })
+            .map_err(audit_refusal)?;
+        self.inner.vault.forget(ns, row)
     }
 
     /// Invalidate every macaroon minted for `seat` so far.
@@ -545,6 +697,9 @@ impl Broker {
             provider_rows: self.inner.vault.provider_rows(),
             service_rows: self.inner.vault.service_rows(),
             guarded_secrets: self.inner.vault.guarded_secrets(),
+            guard_pattern_bytes: self.inner.vault.guard_pattern_bytes(),
+            deployment: deployment_name(self.inner.cfg.deployment).to_owned(),
+            in_flight: *self.inner.flights.borrow(),
             journal: self.inner.journal.stats(),
             http_listen: self.inner.cfg.http_listen.map(|a| a.to_string()),
         }
@@ -558,6 +713,22 @@ impl Broker {
     /// Micro-USD charged so far against a ledger key (see `journal::*_key`).
     pub fn spent(&self, ledger_key: &str) -> u64 {
         self.inner.journal.spent(ledger_key)
+    }
+
+    /// Calls currently between a claimed ticket and its recorded outcome.
+    pub fn in_flight(&self) -> usize {
+        *self.inner.flights.borrow()
+    }
+
+    /// Stop taking calls, cut every stream and in-flight exchange, and wait
+    /// up to `grace` for their outcomes to reach the journal. Returns how
+    /// many flights were still unrecorded at the deadline; those stay
+    /// `InFlight` on disk and come back `Uncertain` at the next start.
+    pub async fn shutdown(&self, grace: Duration) -> usize {
+        self.inner.shutdown.send_replace(true);
+        let mut flights = self.inner.flights.subscribe();
+        let _ = tokio::time::timeout(grace, flights.wait_for(|open| *open == 0)).await;
+        self.in_flight()
     }
 
     // ----- admission --------------------------------------------------------
@@ -576,14 +747,7 @@ impl Broker {
         match ns {
             Namespace::Provider => {
                 self.inner.vault.provider(row)?;
-                let stream = serde_json::from_slice::<TopLevel>(body)
-                    .map(|t| t.stream)
-                    .unwrap_or(false);
-                Ok(if stream {
-                    CallKind::Stream
-                } else {
-                    CallKind::Buffered
-                })
+                Ok(Broker::provider_kind(body))
             }
             Namespace::Service => {
                 let service = self.inner.vault.service(row)?;
@@ -598,24 +762,39 @@ impl Broker {
         }
     }
 
-    fn prepare(
-        &self,
-        ns: Namespace,
-        caller: Caller,
-        call: Call,
-        kind: CallKind,
-        mode: HeaderMode,
-    ) -> Result<Prepared, Refusal> {
-        let vault = &self.inner.vault;
-        let now = now_unix_s();
+    /// Which operation a provider body asks for.
+    pub fn provider_kind(body: &[u8]) -> CallKind {
+        if stream_requested(body) {
+            CallKind::Stream
+        } else {
+            CallKind::Buffered
+        }
+    }
 
-        let token = MacaroonV1::decode(&call.token)
-            .map_err(|e| Refusal::new(Code::BadToken, e.to_string()))?;
+    /// Everything about a token that does not depend on the request:
+    /// signature, seat epoch, uid binding, and whether this peer may call.
+    fn verify_token(&self, token: &str, caller: Caller) -> Result<Verified, Refusal> {
+        if *self.inner.shutdown.borrow() {
+            return Err(Refusal::new(
+                Code::ShuttingDown,
+                "the broker is shutting down and takes no new calls",
+            ));
+        }
+        if !self.may_call(caller.uid) {
+            return Err(Refusal::new(
+                Code::Denied,
+                "this peer runs as the broker's own uid, which can read the master key directly. \
+                 A separated deployment does not serve it as a caller; run callers under another \
+                 uid, or declare the deployment \"development\"",
+            ));
+        }
+        let token =
+            MacaroonV1::decode(token).map_err(|e| Refusal::new(Code::BadToken, e.to_string()))?;
         let verified = token
             .verify(self.root_key())
             .map_err(|e| Refusal::new(Code::BadToken, e.to_string()))?;
-        let seat = verified.root.seat.clone();
-        if verified.root.root_epoch < self.seat_epoch(&seat) {
+        let seat = &verified.root.seat;
+        if verified.root.root_epoch < self.seat_epoch(seat) {
             return Err(Refusal::new(
                 Code::Denied,
                 format!("seat {seat:?} was revoked after this token was minted"),
@@ -638,6 +817,47 @@ impl Broker {
                 }
             }
         }
+        Ok(verified)
+    }
+
+    /// Step 0, for transports: check the token and the route before any
+    /// request body is read. Returns the largest body this caller may send
+    /// to this row. Touches neither disk nor network.
+    pub fn preauthorize(
+        &self,
+        ns: Namespace,
+        row: &str,
+        token: &str,
+        caller: Caller,
+    ) -> Result<usize, Refusal> {
+        let now = self.now()?;
+        let verified = self.verify_token(token, caller)?;
+        let upstream = self.inner.vault.upstream(ns, row)?;
+        verified
+            .admit_route(ns, row, now)
+            .map_err(|e| Refusal::new(Code::Denied, e.to_string()))?;
+        Ok(upstream
+            .max_request_bytes
+            .min(verified.max_request_bytes().unwrap_or(usize::MAX)))
+    }
+
+    /// Largest request body any row accepts.
+    pub fn max_request_bytes(&self) -> usize {
+        self.inner.vault.max_request_bytes()
+    }
+
+    fn prepare(
+        &self,
+        ns: Namespace,
+        caller: Caller,
+        call: Call,
+        kind: CallKind,
+        mode: HeaderMode,
+    ) -> Result<Prepared, Refusal> {
+        let vault = &self.inner.vault;
+        let now = self.now()?;
+        let verified = self.verify_token(&call.token, caller)?;
+        let seat = verified.root.seat.clone();
 
         let path = PlainPath::parse(&call.path)
             .map_err(|e| Refusal::new(Code::PathRefused, e.to_string()))?;
@@ -657,54 +877,62 @@ impl Broker {
             }
         };
 
-        let (upstream, methods, allowed_paths, admission) = match ns {
+        let (upstream, admission) = match ns {
             Namespace::Provider => {
                 let row = vault.provider(&call.row)?;
-                let admission = admit_provider(row, &seat, &method, &call.body, kind, now)?;
-                (&row.upstream, &row.methods, &row.paths, admission)
+                if call.body.len() > row.upstream.max_request_bytes {
+                    return Err(too_large(
+                        ns,
+                        &call.row,
+                        call.body.len(),
+                        row.upstream.max_request_bytes,
+                    ));
+                }
+                let admission = admit_provider(row, &seat, &method, &path, &call.body, kind, now)?;
+                if !verified.spend_scopes.is_empty()
+                    && admission.model.is_some()
+                    && row.prices.is_zero()
+                {
+                    return Err(Refusal::new(
+                        Code::Denied,
+                        format!(
+                            "this token carries MaxSpendMicroUsd, but provider/{} has no token \
+                             prices, so its calls cost nothing here and the cap could not bind",
+                            call.row
+                        ),
+                    ));
+                }
+                (&row.upstream, admission)
             }
             Namespace::Service => {
                 let row = vault.service(&call.row)?;
-                let paths = match kind {
-                    CallKind::Buffered => &row.buffered_paths,
-                    CallKind::Stream => &row.stream_paths,
+                if !row.methods.iter().any(|m| m == method.as_str()) {
+                    return Err(Refusal::new(
+                        Code::MethodRefused,
+                        format!("{ns}/{} does not allow {method}", call.row),
+                    ));
+                }
+                let (paths, what) = match kind {
+                    CallKind::Buffered => (&row.buffered_paths, "buffered_paths"),
+                    CallKind::Stream => (&row.stream_paths, "stream_paths"),
                 };
-                (
-                    &row.upstream,
-                    &row.methods,
-                    paths,
-                    ProviderAdmission::default(),
-                )
+                if !path.under_any(paths) {
+                    return Err(Refusal::new(
+                        Code::PathRefused,
+                        format!("{path} is not under {ns}/{}'s {what}", call.row),
+                    ));
+                }
+                if call.body.len() > row.upstream.max_request_bytes {
+                    return Err(too_large(
+                        ns,
+                        &call.row,
+                        call.body.len(),
+                        row.upstream.max_request_bytes,
+                    ));
+                }
+                (&row.upstream, ProviderAdmission::default())
             }
         };
-        if !methods.iter().any(|m| m == method.as_str()) {
-            return Err(Refusal::new(
-                Code::MethodRefused,
-                format!("{ns}/{} does not allow {method}", call.row),
-            ));
-        }
-        if !path.under_any(allowed_paths) {
-            let what = match (ns, kind) {
-                (Namespace::Provider, _) => "paths",
-                (Namespace::Service, CallKind::Buffered) => "buffered_paths",
-                (Namespace::Service, CallKind::Stream) => "stream_paths",
-            };
-            return Err(Refusal::new(
-                Code::PathRefused,
-                format!("{path} is not under {ns}/{}'s {what}", call.row),
-            ));
-        }
-        if call.body.len() > upstream.max_request_bytes {
-            return Err(Refusal::new(
-                Code::TooLarge,
-                format!(
-                    "request body is {} bytes; {ns}/{} allows {}",
-                    call.body.len(),
-                    call.row,
-                    upstream.max_request_bytes
-                ),
-            ));
-        }
 
         verified
             .admit(&Facts {
@@ -720,6 +948,7 @@ impl Broker {
             .map_err(|e| Refusal::new(Code::Denied, e.to_string()))?;
 
         let headers = forwarded_headers(upstream, &call, mode)?;
+        token_stays_home(&call, query, &headers)?;
 
         let mut url = format!("{}{}", upstream.origin, path);
         if let Some(query) = query {
@@ -744,7 +973,7 @@ impl Broker {
             }));
         }
 
-        let digest = request_digest(ns, kind, &call, method.as_str(), query, &headers);
+        let digest = request_digest(ns, kind, &call, method.as_str(), query, &headers, &verified);
         Ok(Prepared {
             ns,
             row: call.row,
@@ -761,6 +990,8 @@ impl Broker {
             reserve_micro_usd: admission.reserve_micro_usd,
             charges,
             prices: admission.prices,
+            expires_at_unix_s: verified.expires_at_unix_s(),
+            admitted_unix_s: now,
         })
     }
 
@@ -775,7 +1006,7 @@ impl Broker {
                 kind: p.kind,
                 charges: p.charges.clone(),
                 reserve_micro_usd: p.reserve_micro_usd,
-                now_unix_s: now_unix_s(),
+                now_unix_s: p.admitted_unix_s,
                 live_ttl_s: self.inner.cfg.live_ttl_s,
             })
             .map_err(|e| match e {
@@ -840,10 +1071,14 @@ impl Broker {
                 ))
             }
         }
+        self.inner
+            .flights
+            .send_modify(|open| *open = open.saturating_add(1));
         let mut guard = FlightGuard {
             broker: self.clone(),
             id,
             armed: true,
+            counted: Some(InFlight(self.clone())),
         };
 
         let audited = self.inner.audit.append(&AuditEvent::Begin {
@@ -865,13 +1100,28 @@ impl Broker {
             self.record(id, TicketState::Live)?;
             return Err(audit_refusal(e));
         }
+        // Only streams are cut at expiry; a buffered call is already
+        // bounded by `buffered_timeout_ms`.
+        let expires = p
+            .expires_at_unix_s
+            .filter(|_| p.kind == CallKind::Stream)
+            .and_then(|at| {
+                let left = Duration::from_secs(at.saturating_sub(p.admitted_unix_s));
+                tokio::time::Instant::now().checked_add(left)
+            });
+        let watch = CutWatch {
+            epoch,
+            generation: secret.generation,
+            seats: self.inner.seats.subscribe(),
+            seat: p.seat.clone(),
+            root_epoch: p.root_epoch,
+            shutdown: self.inner.shutdown.subscribe(),
+            expires,
+        };
         Ok(Flight {
             guard,
             secret,
-            epoch,
-            seat_epoch: self.inner.seats.subscribe(),
-            seat: p.seat.clone(),
-            root_epoch: p.root_epoch,
+            watch,
             automaton,
         })
     }
@@ -965,10 +1215,9 @@ impl Broker {
 
         let mut flight = flight.expect("Live ticket was claimed");
         let upstream = self.inner.vault.upstream(p.ns, &p.row)?;
-        let generation = flight.secret.generation;
         let outcome = tokio::select! {
             biased;
-            _ = wait_revoked(&mut flight.epoch, generation, &mut flight.seat_epoch, &flight.seat, flight.root_epoch) => Err(ExchangeError::Revoked),
+            cut = flight.watch.cut() => Err(ExchangeError::Cut(cut)),
             outcome = self.buffered_exchange(&p, &flight.secret, upstream, &flight.automaton) => outcome,
         };
 
@@ -1037,9 +1286,7 @@ impl Broker {
             }
             Err(failure) => {
                 let (code, reason) = match failure {
-                    ExchangeError::Revoked => {
-                        (Code::Revoked, "secret revoked mid-flight".to_owned())
-                    }
+                    ExchangeError::Cut(cut) => (cut.code(), cut.reason().to_owned()),
                     ExchangeError::TooLarge => (
                         Code::TooLarge,
                         format!(
@@ -1134,10 +1381,9 @@ impl Broker {
 
         let mut flight = flight.expect("Live ticket was claimed");
         let upstream = self.inner.vault.upstream(p.ns, &p.row)?;
-        let generation = flight.secret.generation;
         let sent = tokio::select! {
             biased;
-            _ = wait_revoked(&mut flight.epoch, generation, &mut flight.seat_epoch, &flight.seat, flight.root_epoch) => Err(ExchangeError::Revoked),
+            cut = flight.watch.cut() => Err(ExchangeError::Cut(cut)),
             sent = self.send(&p, &flight.secret, upstream) => sent,
         };
         let response = match sent {
@@ -1158,15 +1404,10 @@ impl Broker {
                     ),
                 ));
             }
-            Err(ExchangeError::Revoked) => {
-                let summary = cut_summary(0, ClosedBy::Revoked);
+            Err(ExchangeError::Cut(cut)) => {
+                let summary = cut_summary(0, cut.closed_by());
                 return Err(self
-                    .close_refused(
-                        flight,
-                        summary,
-                        Code::Revoked,
-                        "secret revoked before the stream opened",
-                    )
+                    .close_refused(flight, summary, cut.code(), cut.reason())
                     .await);
             }
             Err(ExchangeError::Upstream(why)) => {
@@ -1251,19 +1492,18 @@ impl Broker {
     }
 
     /// The stream relay. One task per open stream; it parks in `select!`
-    /// on four wakers and performs no I/O other than the two sockets:
-    /// row and seat epochs (revocation), the caller going away, and the next
-    /// upstream chunk.
+    /// and performs no I/O other than the two sockets. It wakes for a cut
+    /// (row or seat revocation, token expiry, shutdown), for the caller
+    /// going away, and for the next upstream chunk.
     async fn relay(
         self,
         mut flight: Flight,
         mut response: reqwest::Response,
-        prices: Option<(u64, u64)>,
+        prices: Option<Prices>,
         status: u16,
         items: mpsc::Sender<StreamItem>,
     ) {
         let id = flight.guard.id;
-        let generation = flight.secret.generation;
         let mut guard = EchoGuard::new(flight.automaton.clone());
         let mut usage = prices.map(|_| UsageSniffer::default());
         let mut delivered = 0u64;
@@ -1272,7 +1512,7 @@ impl Broker {
         let closed_by = loop {
             tokio::select! {
                 biased;
-                _ = wait_revoked(&mut flight.epoch, generation, &mut flight.seat_epoch, &flight.seat, flight.root_epoch) => break ClosedBy::Revoked,
+                cut = flight.watch.cut() => break cut.closed_by(),
                 _ = items.closed() => break ClosedBy::CallerDisconnect,
                 chunk = response.chunk() => {
                     let last = match chunk {
@@ -1296,7 +1536,7 @@ impl Broker {
                         let data = Bytes::from(std::mem::take(&mut safe));
                         let sent = tokio::select! {
                             biased;
-                            _ = wait_revoked(&mut flight.epoch, generation, &mut flight.seat_epoch, &flight.seat, flight.root_epoch) => Err(ClosedBy::Revoked),
+                            cut = flight.watch.cut() => Err(cut.closed_by()),
                             sent = items.send(StreamItem::Chunk(data)) => sent.map_err(|_| ClosedBy::CallerDisconnect),
                         };
                         match sent {
@@ -1348,25 +1588,44 @@ impl Broker {
     }
 }
 
-/// Pure in-memory notification for either revocation domain; no timers or disk.
-async fn wait_revoked(
-    epoch: &mut watch::Receiver<RowEpoch>,
-    generation: u64,
-    seats: &mut watch::Receiver<Arc<BTreeMap<String, u64>>>,
-    seat: &str,
-    root_epoch: u64,
-) {
-    loop {
-        if epoch.borrow_and_update().revoked_floor > generation
-            || seats.borrow_and_update().get(seat).copied().unwrap_or(0) > root_epoch
-        {
-            return;
-        }
-        tokio::select! {
-            result = epoch.changed() => if result.is_err() { return; },
-            result = seats.changed() => if result.is_err() { return; },
+impl Cut {
+    fn closed_by(self) -> ClosedBy {
+        match self {
+            Cut::Revoked => ClosedBy::Revoked,
+            Cut::Expired => ClosedBy::Expired,
+            Cut::Shutdown => ClosedBy::Shutdown,
         }
     }
+
+    fn code(self) -> Code {
+        match self {
+            Cut::Revoked => Code::Revoked,
+            Cut::Expired => Code::Denied,
+            Cut::Shutdown => Code::ShuttingDown,
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Cut::Revoked => "secret or seat revoked mid-flight",
+            Cut::Expired => "the token expired while the stream was open",
+            Cut::Shutdown => "the broker shut down mid-flight",
+        }
+    }
+}
+
+fn deployment_name(deployment: Deployment) -> &'static str {
+    match deployment {
+        Deployment::Separated => "separated",
+        Deployment::Development => "development",
+    }
+}
+
+fn too_large(ns: Namespace, row: &str, have: usize, max: usize) -> Refusal {
+    Refusal::new(
+        Code::TooLarge,
+        format!("request body is {have} bytes; {ns}/{row} allows {max}"),
+    )
 }
 
 fn cut_summary(status: u16, closed_by: ClosedBy) -> StreamSummary {
@@ -1442,10 +1701,22 @@ fn head_is_clean(automaton: &EchoAutomaton, response: &reqwest::Response) -> boo
     clean
 }
 
+/// Upstream reply headers a caller gets to see. Dropped: hop-by-hop
+/// headers, including any the upstream names in `Connection`; and anything
+/// in keygate's own `x-keygate-*` namespace, which only keygate may set.
 fn caller_visible_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    let hop_by_hop: Vec<String> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect();
     headers
         .iter()
-        .filter(|(name, _)| !RESERVED_HEADERS.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            !header_is_reserved(name.as_str()) && !hop_by_hop.iter().any(|h| h == name.as_str())
+        })
         .map(|(name, value)| {
             (
                 name.as_str().to_owned(),
@@ -1453,6 +1724,33 @@ fn caller_visible_headers(headers: &HeaderMap) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+/// A keygate token is a credential for keygate only. Refuse a request that
+/// would carry one to the upstream in its query, a forwarded header, or
+/// (the presented token itself) its body.
+fn token_stays_home(call: &Call, query: Option<&str>, headers: &HeaderMap) -> Result<(), Refusal> {
+    let marker = TOKEN_PREFIX.as_bytes();
+    let has = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+    if query.is_some_and(|q| has(q.as_bytes(), marker)) {
+        return Err(Refusal::new(
+            Code::PathRefused,
+            "the query contains a keygate token (kgm_); tokens are never forwarded upstream",
+        ));
+    }
+    if let Some((name, _)) = headers.iter().find(|(_, v)| has(v.as_bytes(), marker)) {
+        return Err(Refusal::new(
+            Code::HeaderRefused,
+            format!("header {name:?} contains a keygate token (kgm_); tokens are never forwarded upstream"),
+        ));
+    }
+    if has(&call.body, call.token.as_bytes()) {
+        return Err(Refusal::new(
+            Code::BadRequest,
+            "the request body contains the presented keygate token; it would be sent upstream",
+        ));
+    }
+    Ok(())
 }
 
 fn forwarded_headers(
@@ -1517,8 +1815,8 @@ fn forwarded_headers(
     Ok(headers)
 }
 
-/// Identity of a request: two calls with equal digests (for one seat) are
-/// the same request, and the second is a retry.
+/// Identity of a request: two calls with equal digests are the same
+/// request from the same token, and the second is a retry.
 fn request_digest(
     ns: Namespace,
     kind: CallKind,
@@ -1526,12 +1824,23 @@ fn request_digest(
     method: &str,
     query: Option<&str>,
     headers: &HeaderMap,
+    verified: &Verified,
 ) -> RequestDigest32 {
     fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     }
-    let mut hasher = blake3::Hasher::new_derive_key("keygate-request/v1 digest");
+    let mut hasher = blake3::Hasher::new_derive_key("keygate-request/v2 digest");
+    // Tickets belong to the exact token that opened them: a different
+    // token, even of the same seat and even one attenuated from this one,
+    // gets its own ticket, its own reservation and no view of this reply.
+    field(&mut hasher, &verified.owner);
+    let mut scopes: Vec<&[u8; 32]> = verified.spend_scopes.iter().map(|s| &s.id).collect();
+    scopes.sort_unstable();
+    hasher.update(&(scopes.len() as u64).to_le_bytes());
+    for scope in scopes {
+        field(&mut hasher, scope);
+    }
     field(&mut hasher, ns.as_str().as_bytes());
     field(
         &mut hasher,
@@ -1563,376 +1872,9 @@ fn request_digest(
     *hasher.finalize().as_bytes()
 }
 
-// ----- provider policy -------------------------------------------------------
-
-#[derive(Default)]
-struct ProviderAdmission {
-    model: Option<String>,
-    reserve_micro_usd: u64,
-    charges: Vec<Charge>,
-    prices: Option<(u64, u64)>,
-}
-
-/// The top level of an LLM request body, parsed strictly: a duplicated key
-/// is refused, because keygate and the upstream could disagree about which
-/// occurrence wins and the model allowlist would be checking the wrong one.
-#[derive(Default)]
-struct TopLevel {
-    model: Option<String>,
-    output_caps: Vec<u64>,
-    n: Option<u64>,
-    stream: bool,
-}
-
-impl<'de> Deserialize<'de> for TopLevel {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct TopVisitor;
-        impl<'de> Visitor<'de> for TopVisitor {
-            type Value = TopLevel;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON object")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<TopLevel, A::Error> {
-                let mut top = TopLevel::default();
-                let mut seen = HashSet::new();
-                while let Some(key) = map.next_key::<String>()? {
-                    if !seen.insert(key.clone()) {
-                        return Err(serde::de::Error::custom(format!("duplicate key {key:?}")));
-                    }
-                    match key.as_str() {
-                        "model" => top.model = Some(map.next_value()?),
-                        "max_tokens" | "max_output_tokens" | "max_completion_tokens" => {
-                            top.output_caps.push(map.next_value()?)
-                        }
-                        "n" => top.n = Some(map.next_value()?),
-                        "stream" => top.stream = map.next_value()?,
-                        _ => {
-                            map.next_value::<IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(top)
-            }
-        }
-        deserializer.deserialize_map(TopVisitor)
-    }
-}
-
-fn micro_usd(tokens_in: u64, tokens_out: u64, (price_in, price_out): (u64, u64)) -> u64 {
-    // Each product fits in u128; their sum may not.
-    let total = (u128::from(tokens_in) * u128::from(price_in))
-        .saturating_add(u128::from(tokens_out) * u128::from(price_out));
-    u64::try_from(total.div_ceil(1_000_000)).unwrap_or(u64::MAX)
-}
-
-fn admit_provider(
-    row: &ProviderRow,
-    seat: &str,
-    method: &reqwest::Method,
-    body: &[u8],
-    kind: CallKind,
-    now: u64,
-) -> Result<ProviderAdmission, Refusal> {
-    let name = &row.upstream.name;
-    if *method != reqwest::Method::POST {
-        if kind == CallKind::Stream {
-            return Err(Refusal::new(
-                Code::BadRequest,
-                "provider streams are POST requests with \"stream\": true",
-            ));
-        }
-        if !body.is_empty() {
-            return Err(Refusal::new(
-                Code::BadRequest,
-                format!("{method} to a provider must not carry a body"),
-            ));
-        }
-        return Ok(ProviderAdmission::default());
-    }
-
-    let top: TopLevel = serde_json::from_slice(body).map_err(|e| {
-        Refusal::new(
-            Code::BadRequest,
-            format!("provider request body must be a JSON object: {e}"),
-        )
-    })?;
-    let Some(model) = top.model else {
-        return Err(Refusal::new(
-            Code::ModelRefused,
-            "request body names no model",
-        ));
-    };
-    if !row.models.contains(&model) {
-        return Err(Refusal::new(
-            Code::ModelRefused,
-            format!("model {model:?} is not allowed on provider/{name}"),
-        ));
-    }
-    match (kind, top.stream) {
-        (CallKind::Buffered, true) => {
-            return Err(Refusal::new(
-                Code::BadRequest,
-                "body sets \"stream\": true; use provider-stream",
-            ))
-        }
-        (CallKind::Stream, false) => {
-            return Err(Refusal::new(
-                Code::BadRequest,
-                "provider-stream requires \"stream\": true in the body",
-            ))
-        }
-        _ => {}
-    }
-    let Some(cap) = top.output_caps.iter().copied().max() else {
-        return Err(Refusal::new(
-            Code::TokenCapRefused,
-            format!(
-                "request must set max_tokens (at most {}); an uncapped call cannot be budgeted",
-                row.max_output_tokens
-            ),
-        ));
-    };
-    let n = top.n.unwrap_or(1);
-    if !(1..=16).contains(&n) {
-        return Err(Refusal::new(
-            Code::TokenCapRefused,
-            "n must be between 1 and 16",
-        ));
-    }
-    let cap = cap
-        .checked_mul(n)
-        .ok_or_else(|| Refusal::new(Code::TokenCapRefused, "output token cap times n overflows"))?;
-    if cap > row.max_output_tokens {
-        return Err(Refusal::new(
-            Code::TokenCapRefused,
-            format!(
-                "aggregate output token cap {cap} exceeds provider/{name}'s limit {}",
-                row.max_output_tokens
-            ),
-        ));
-    }
-
-    // Reservation: the output cap is exact; input is estimated at one token
-    // per three body bytes. Complete replies settle to metered usage.
-    let prices = (row.input_micro_usd_per_mtok, row.output_micro_usd_per_mtok);
-    let reserve = micro_usd(body.len().div_ceil(3) as u64, cap, prices);
-    if let Some(limit) = row.per_call_micro_usd {
-        if reserve > limit {
-            return Err(Refusal::new(
-                Code::BudgetExceeded,
-                format!("call would reserve {reserve} micro-USD; per-call limit is {limit}"),
-            ));
-        }
-    }
-    let day = journal::utc_day(now);
-    Ok(ProviderAdmission {
-        model: Some(model),
-        reserve_micro_usd: reserve,
-        charges: vec![
-            Charge {
-                key: journal::row_day_key(name, day),
-                cap_micro_usd: row.per_day_micro_usd,
-            },
-            Charge {
-                key: journal::seat_day_key(name, seat, day),
-                cap_micro_usd: row.per_seat_day_micro_usd,
-            },
-        ],
-        prices: (reserve > 0).then_some(prices),
-    })
-}
-
-/// Both APIs report cumulative usage; OpenAI prompt_tokens already includes
-/// its cached tokens. Anthropic's cache counters are additional input tokens.
-#[derive(Deserialize)]
-struct Usage {
-    #[serde(alias = "prompt_tokens")]
-    input_tokens: Option<u64>,
-    #[serde(alias = "completion_tokens")]
-    output_tokens: Option<u64>,
-    #[serde(default)]
-    cache_creation_input_tokens: u64,
-    #[serde(default)]
-    cache_read_input_tokens: u64,
-}
-
-impl Usage {
-    fn input(&self) -> Option<u64> {
-        Some(
-            self.input_tokens?
-                .saturating_add(self.cache_creation_input_tokens)
-                .saturating_add(self.cache_read_input_tokens),
-        )
-    }
-
-    fn cost(&self, prices: (u64, u64)) -> Option<u64> {
-        Some(micro_usd(self.input()?, self.output_tokens?, prices))
-    }
-}
-
-fn metered_cost(body: &[u8], prices: (u64, u64)) -> Option<u64> {
-    #[derive(Deserialize)]
-    struct Reply {
-        usage: Usage,
-    }
-    serde_json::from_slice::<Reply>(body)
-        .ok()?
-        .usage
-        .cost(prices)
-}
-
-/// Bounded SSE observation only: it never rewrites or delays stream bytes.
-/// Oversized/malformed events invalidate metering, preserving the reservation.
-#[derive(Default)]
-struct UsageSniffer {
-    line: zeroize::Zeroizing<Vec<u8>>,
-    data: zeroize::Zeroizing<Vec<u8>>,
-    after_cr: bool,
-    invalid: bool,
-    input: Option<u64>,
-    output: Option<u64>,
-}
-
-impl UsageSniffer {
-    const MAX_EVENT: usize = 64 * 1024;
-
-    fn push(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if self.invalid {
-                return;
-            }
-            if self.after_cr && byte == b'\n' {
-                self.after_cr = false;
-                continue;
-            }
-            self.after_cr = byte == b'\r';
-            if matches!(byte, b'\r' | b'\n') {
-                self.line_end();
-            } else if self.line.len() + self.data.len() < Self::MAX_EVENT {
-                self.line.push(byte);
-            } else {
-                self.invalid = true;
-                self.line.zeroize();
-                self.data.zeroize();
-            }
-        }
-    }
-
-    fn line_end(&mut self) {
-        if self.line.is_empty() {
-            if !self.data.is_empty() {
-                self.event();
-            }
-            self.data.zeroize();
-        } else if self.line.as_slice() == b"data" || self.line.starts_with(b"data:") {
-            let value = self.line.get(5..).unwrap_or_default();
-            let value = value.strip_prefix(b" ").unwrap_or(value);
-            self.data.extend_from_slice(value);
-            self.data.push(b'\n');
-        }
-        self.line.zeroize();
-    }
-
-    fn event(&mut self) {
-        if self.data.as_slice() == b"[DONE]\n" {
-            return;
-        }
-        let Ok(event) = serde_json::from_slice::<serde_json::Value>(&self.data) else {
-            self.invalid = true;
-            return;
-        };
-        let kind = event.get("type").and_then(|v| v.as_str());
-        if kind == Some("error") || event.get("error").is_some() {
-            self.invalid = true;
-            return;
-        }
-        let usage = match kind {
-            Some("message_start") => event.get("message").and_then(|v| v.get("usage")),
-            Some("response.completed") => event.get("response").and_then(|v| v.get("usage")),
-            _ => event.get("usage"),
-        };
-        let Some(usage) = usage.filter(|v| !v.is_null()) else {
-            return;
-        };
-        let Ok(usage) = serde_json::from_value::<Usage>(usage.clone()) else {
-            self.invalid = true;
-            return;
-        };
-        if let Some(input) = usage.input() {
-            self.input = Some(self.input.unwrap_or(0).max(input));
-        }
-        // message_start's output count is provisional, not final usage.
-        if kind != Some("message_start") {
-            if let Some(output) = usage.output_tokens {
-                self.output = Some(self.output.unwrap_or(0).max(output));
-            }
-        }
-    }
-
-    fn cost(self, prices: (u64, u64)) -> Option<u64> {
-        if self.invalid || !self.line.is_empty() || !self.data.is_empty() {
-            return None;
-        }
-        Some(micro_usd(self.input?, self.output?, prices))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn top_level_refuses_duplicate_keys() {
-        let ok: TopLevel = serde_json::from_str(
-            r#"{"model":"m","max_tokens":5,"stream":true,"messages":[{"model":"x"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(ok.model.as_deref(), Some("m"));
-        assert_eq!(ok.output_caps, vec![5]);
-        assert!(ok.stream);
-        assert!(serde_json::from_str::<TopLevel>(r#"{"model":"cheap","model":"dear"}"#).is_err());
-        assert!(
-            serde_json::from_str::<TopLevel>(r#"{"max_tokens":1,"max_tokens":999999}"#).is_err()
-        );
-        assert!(serde_json::from_str::<TopLevel>(r#"["model"]"#).is_err());
-        assert!(serde_json::from_str::<TopLevel>(r#"{"max_tokens":-1}"#).is_err());
-    }
-
-    #[test]
-    fn pricing_rounds_up_and_does_not_overflow() {
-        assert_eq!(micro_usd(1, 0, (1, 0)), 1);
-        assert_eq!(
-            micro_usd(1_000_000, 1_000_000, (3_000_000, 15_000_000)),
-            18_000_000
-        );
-        assert_eq!(micro_usd(0, 0, (5, 5)), 0);
-        assert_eq!(
-            micro_usd(u64::MAX, u64::MAX, (u64::MAX, u64::MAX)),
-            u64::MAX
-        );
-    }
-
-    #[test]
-    fn usage_is_read_in_both_dialects() {
-        let prices = (1_000_000, 2_000_000);
-        assert_eq!(
-            metered_cost(
-                br#"{"usage":{"input_tokens":10,"output_tokens":5}}"#,
-                prices
-            ),
-            Some(20)
-        );
-        assert_eq!(
-            metered_cost(
-                br#"{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
-                prices
-            ),
-            Some(20)
-        );
-        assert_eq!(metered_cost(br#"{"error":"x"}"#, prices), None);
-    }
 
     async fn read_request_head(socket: &mut tokio::net::TcpStream) {
         use tokio::io::AsyncReadExt;
@@ -1950,6 +1892,9 @@ mod tests {
         Broker::init_state(dir.path()).unwrap();
         let cfg = Config::parse(&format!(
             r#"
+[broker]
+deployment = "development"
+
 [services.api]
 origin = "{origin}"
 buffered_paths = ["/"]
@@ -1963,6 +1908,7 @@ stream_paths = ["/events"]
                 Namespace::Service,
                 "api",
                 SecretBytes::new(b"old-secret-123456".to_vec()),
+                false,
                 false,
                 Caller { uid: None },
             )
@@ -2013,19 +1959,24 @@ stream_paths = ["/events"]
                     "api",
                     SecretBytes::new(b"new-secret-123456".to_vec()),
                     false,
+                    false,
                     Caller { uid: None },
                 )
             })
             .await
             .unwrap();
         let upstream = broker.inner.vault.upstream(p.ns, &p.row).unwrap();
-        assert!(!broker
-            .inner
-            .vault
-            .snapshot(upstream)
-            .unwrap()
-            .1
-            .contains(flight.secret.expose()));
+        let shared = |b: &Broker| b.inner.vault.snapshot(upstream).unwrap().1;
+        // Rotation retires the old secret into the shared guard...
+        assert!(shared(&broker).contains(flight.secret.expose()));
+        // ...and once the operator forgets it, only this flight's own
+        // snapshot still guards the secret it was actually sent with.
+        let forgotten = broker
+            .disk(|b| b.forget(Namespace::Service, "api", Caller { uid: None }))
+            .await
+            .unwrap();
+        assert_eq!(forgotten, 1);
+        assert!(!shared(&broker).contains(flight.secret.expose()));
         let serve = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             read_request_head(&mut socket).await;
@@ -2045,10 +1996,29 @@ stream_paths = ["/events"]
         serve.await.unwrap();
     }
 
-    /// #tooth: revocation wakes the same pending wait on either domain and
-    /// already-revoked seats are detected on the very first poll.
+    fn cut_watch(
+        row: &watch::Sender<RowEpoch>,
+        seats: &watch::Sender<Arc<BTreeMap<String, u64>>>,
+        shutdown: &watch::Sender<bool>,
+        expires: Option<tokio::time::Instant>,
+    ) -> CutWatch {
+        CutWatch {
+            epoch: row.subscribe(),
+            generation: 1,
+            seats: seats.subscribe(),
+            seat: "seat".into(),
+            root_epoch: 0,
+            shutdown: shutdown.subscribe(),
+            expires,
+        }
+    }
+
+    /// #tooth: every cut source wakes the same pending wait by in-memory
+    /// notification, and a condition that already holds is seen on the
+    /// first poll. The 100 microsecond bound is a measurement of the wake
+    /// itself (send to ready), not of a whole stream teardown.
     #[tokio::test]
-    async fn tooth_seat_epoch_wakes_without_io_or_timer() {
+    async fn tooth_cut_sources_wake_without_io() {
         use std::future::Future;
         use std::task::Poll;
         let row = watch::Sender::new(RowEpoch {
@@ -2056,65 +2026,85 @@ stream_paths = ["/events"]
             revoked_floor: 0,
         });
         let seats = watch::Sender::new(Arc::new(BTreeMap::new()));
-        let mut r = row.subscribe();
-        let mut s = seats.subscribe();
-        let wait = wait_revoked(&mut r, 1, &mut s, "seat", 0);
-        tokio::pin!(wait);
-        std::future::poll_fn(|cx| {
-            assert!(wait.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        let start = Instant::now();
-        seats.send_replace(Arc::new(BTreeMap::from([("seat".into(), 1)])));
-        std::future::poll_fn(|cx| {
-            assert!(wait.as_mut().poll(cx).is_ready());
-            Poll::Ready(())
-        })
-        .await;
-        let elapsed = start.elapsed();
+        let shutdown = watch::Sender::new(false);
+
+        let wake = |fire: &dyn Fn()| {
+            let mut watch = cut_watch(&row, &seats, &shutdown, None);
+            let mut wait = Box::pin(async move { watch.cut().await });
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            let start = Instant::now();
+            fire();
+            let Poll::Ready(cut) = wait.as_mut().poll(&mut cx) else {
+                panic!("cut source did not wake the wait")
+            };
+            (cut, start.elapsed())
+        };
+        let (cut, elapsed) = wake(&|| {
+            seats.send_replace(Arc::new(BTreeMap::from([("seat".into(), 1)])));
+        });
+        assert_eq!(cut, Cut::Revoked);
         assert!(
             elapsed < Duration::from_micros(100),
-            "seat notification took {elapsed:?}"
+            "seat wake took {elapsed:?}"
         );
-        let mut r = row.subscribe();
-        let mut s = seats.subscribe();
+        seats.send_replace(Arc::new(BTreeMap::new()));
+
+        let (cut, elapsed) = wake(&|| {
+            row.send_replace(RowEpoch {
+                generation: 1,
+                revoked_floor: 2,
+            });
+        });
+        assert_eq!(cut, Cut::Revoked);
+        assert!(
+            elapsed < Duration::from_micros(100),
+            "row wake took {elapsed:?}"
+        );
+        row.send_replace(RowEpoch {
+            generation: 1,
+            revoked_floor: 0,
+        });
+
+        let (cut, _) = wake(&|| {
+            shutdown.send_replace(true);
+        });
+        assert_eq!(cut, Cut::Shutdown);
+
+        // Already cut: no send can start.
+        let mut watch = cut_watch(&row, &seats, &shutdown, None);
         tokio::select! {
             biased;
-            _ = wait_revoked(&mut r, 1, &mut s, "seat", 0) => {},
-            _ = std::future::ready(()) => panic!("revoked seat could start an upstream send"),
+            cut = watch.cut() => assert_eq!(cut, Cut::Shutdown),
+            _ = std::future::ready(()) => panic!("a shut-down broker could start an upstream send"),
         }
     }
 
-    /// #tooth: SSE parsing is chunk-independent, bounded, and requires
-    /// complete input/output usage; partial final events cannot settle.
-    #[test]
-    fn tooth_usage_sniffer_bounds_and_partial_events() {
-        let event =
-            b"data: {\"usage\":\ndata: {\"prompt_tokens\":3,\"completion_tokens\":2}}\r\n\r\n";
-        for width in 1..=event.len() {
-            let mut sniff = UsageSniffer::default();
-            for chunk in event.chunks(width) {
-                sniff.push(chunk);
-            }
-            assert_eq!(sniff.cost((1_000_000, 2_000_000)), Some(7));
-        }
-        for bad in [
-            b"data: {\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}".as_slice(),
-            b"data: {\"usage\":{\"input_tokens\":1}}\n\n",
-            b"data: {\"usage\":{\"input_tokens\":-1,\"output_tokens\":2}}\n\n",
-        ] {
-            let mut sniff = UsageSniffer::default();
-            sniff.push(bad);
-            assert_eq!(sniff.cost((1, 1)), None);
-        }
-        let mut sniff = UsageSniffer::default();
-        sniff.push(&vec![b'x'; UsageSniffer::MAX_EVENT + 1]);
-        assert!(sniff.invalid);
-        assert!(sniff.line.is_empty() && sniff.data.is_empty());
-        sniff.push(event);
-        assert_eq!(sniff.cost((1, 1)), None);
-        assert_eq!(metered_cost(br#"{"usage":{"input_tokens":1,"cache_read_input_tokens":18446744073709551615,"cache_creation_input_tokens":1,"output_tokens":0}}"#, (1_000_000, 0)), Some(u64::MAX));
+    /// #tooth: a stream's wait ends at the token's expiry, by timer, and
+    /// not before it.
+    #[tokio::test(start_paused = true)]
+    async fn tooth_cut_watch_expires_on_the_token_deadline() {
+        let row = watch::Sender::new(RowEpoch {
+            generation: 1,
+            revoked_floor: 0,
+        });
+        let seats = watch::Sender::new(Arc::new(BTreeMap::new()));
+        let shutdown = watch::Sender::new(false);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut watch = cut_watch(&row, &seats, &shutdown, Some(deadline));
+        assert!(tokio::time::timeout(Duration::from_secs(29), watch.cut())
+            .await
+            .is_err());
+        assert_eq!(watch.cut().await, Cut::Expired);
+        assert!(tokio::time::Instant::now() >= deadline);
+        // Without an expiry there is no timer at all.
+        let mut forever = cut_watch(&row, &seats, &shutdown, None);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(86_400 * 365), forever.cut())
+                .await
+                .is_err()
+        );
     }
 
     /// #tooth: even a stalled disk job cannot occupy the sole async worker.

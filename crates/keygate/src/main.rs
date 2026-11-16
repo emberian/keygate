@@ -5,18 +5,20 @@
 //! or `--token-file` (`-` for stdin).
 
 use clap::{Args, Parser, Subcommand};
-use keygate_broker::client::Client;
+use keygate_broker::client::{Client, ExpectedBroker};
 use keygate_broker::engine::{CONFIG_FILE, MASTER_KEY_FILE};
+use keygate_broker::harden;
 use keygate_broker::{Broker, BrokerOptions, Listeners};
-use keygate_core::config::{Config, EXAMPLE};
+use keygate_core::config::{self, Config, Deployment};
 use keygate_core::macaroon::{Caveat, MacaroonV1};
 use keygate_core::proto::{Call, Request, Response, ServiceAuthorize};
-use keygate_core::{now_unix_s, Namespace};
+use keygate_core::{unix_time, Namespace};
 use std::error::Error;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 use zeroize::Zeroize;
 
 type Fallible<T> = Result<T, Box<dyn Error>>;
@@ -34,6 +36,11 @@ struct Cli {
     /// Broker socket; defaults to <state>/keygate.sock.
     #[arg(long, env = "KEYGATE_SOCKET", global = true)]
     socket: Option<PathBuf>,
+    /// The uid the broker must be running as. Without it, the listener is
+    /// trusted only if it owns the socket file in a directory nobody else
+    /// can write.
+    #[arg(long, env = "KEYGATE_BROKER_UID", global = true)]
+    broker_uid: Option<u32>,
     #[command(subcommand)]
     command: Command,
 }
@@ -53,9 +60,23 @@ enum Command {
         /// Also cut streams still running on the previous secret.
         #[arg(long)]
         cut_existing: bool,
+        /// Also drop the row's retired secrets (the old key is already
+        /// invalid upstream and need not be withheld from responses).
+        #[arg(long)]
+        forget_retired: bool,
     },
-    /// Operator: destroy a row's secret and cut every stream using it.
-    Revoke { namespace: Namespace, row: String },
+    /// Operator: stop using a row's secret and cut every stream on it. The
+    /// secret stays sealed as a retired guard pattern until `forget`.
+    Revoke {
+        namespace: Namespace,
+        row: String,
+        /// Destroy the secret outright instead of retiring it.
+        #[arg(long)]
+        forget: bool,
+    },
+    /// Operator: drop a row's retired secrets. They stop being withheld
+    /// from responses and are removed from disk.
+    Forget { namespace: Namespace, row: String },
     /// Operator: invalidate every macaroon minted for a seat so far.
     RevokeSeat { seat: String },
     /// Operator: list rows and their epochs.
@@ -140,7 +161,17 @@ struct CaveatArgs {
 }
 
 impl CaveatArgs {
-    fn caveats(self) -> Vec<Caveat> {
+    fn caveats(self) -> Fallible<Vec<Caveat>> {
+        // A relative expiry needs a working clock; there is no fallback.
+        let expires_at = match (self.expires_at, self.ttl_s) {
+            (Some(at), _) => Some(at),
+            (None, Some(ttl)) => Some(unix_time()?.saturating_add(ttl)),
+            (None, None) => None,
+        };
+        Ok(self.caveat_list(expires_at))
+    }
+
+    fn caveat_list(self, expires_at: Option<u64>) -> Vec<Caveat> {
         let list = |items: Vec<String>, make: fn(Vec<String>) -> Caveat| {
             (!items.is_empty()).then(|| make(items))
         };
@@ -153,9 +184,7 @@ impl CaveatArgs {
             list(self.models, Caveat::Models),
             self.max_request_bytes.map(Caveat::MaxRequestBytes),
             self.max_spend_micro_usd.map(Caveat::MaxSpendMicroUsd),
-            self.expires_at
-                .or(self.ttl_s.map(|ttl| now_unix_s().saturating_add(ttl)))
-                .map(Caveat::ExpiresAtUnixS),
+            expires_at.map(Caveat::ExpiresAtUnixS),
         ]
         .into_iter()
         .flatten()
@@ -246,8 +275,15 @@ fn state_dir(cli_state: &Option<PathBuf>) -> Fallible<&Path> {
         .ok_or_else(|| "no state directory: pass --state or set KEYGATE_STATE".into())
 }
 
-async fn connect(socket: &Option<PathBuf>, state: &Option<PathBuf>) -> Fallible<Client> {
-    let socket = match (socket, state) {
+/// Where the broker is and who it must be.
+struct Target {
+    state: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    broker_uid: Option<u32>,
+}
+
+async fn connect(target: &Target) -> Fallible<Client> {
+    let socket = match (&target.socket, &target.state) {
         (Some(socket), _) => socket.clone(),
         (None, Some(state)) => state.join("keygate.sock"),
         (None, None) => {
@@ -257,7 +293,10 @@ async fn connect(socket: &Option<PathBuf>, state: &Option<PathBuf>) -> Fallible<
             )
         }
     };
-    Client::connect(&socket)
+    let expected = target
+        .broker_uid
+        .map_or(ExpectedBroker::SocketOwner, ExpectedBroker::Uid);
+    Client::connect_expecting(&socket, expected)
         .await
         .map_err(|e| format!("cannot reach the broker at {}: {e}", socket.display()).into())
 }
@@ -282,29 +321,65 @@ fn init(state: &Path) -> Fallible<()> {
     Broker::init_state(state)?;
     let config = state.join(CONFIG_FILE);
     if !config.exists() {
+        // The initializing user is the broker's uid and its first operator.
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&config)?
-            .write_all(EXAMPLE.as_bytes())?;
+            .write_all(config::example(harden::effective_uid()).as_bytes())?;
     }
     println!("initialized {}", state.display());
     println!("edit {} and run `keygate serve`", config.display());
+    println!(
+        "run the broker under its own uid; callers need another uid and a socket they can reach"
+    );
     Ok(())
 }
 
 async fn serve(state: &Path) -> Fallible<()> {
+    // Before any key is read: no core dumps, no same-uid ptrace or
+    // /proc/<pid>/mem, private files.
+    let hardening = harden::harden_process();
+    let uid = harden::effective_uid();
     let config_path = state.join(CONFIG_FILE);
-    let text = std::fs::read_to_string(&config_path)
+    let text = harden::read_config(&config_path, uid)
         .map_err(|e| format!("{}: {e}", config_path.display()))?;
     let config = Config::parse(&text)?;
+    let deployment = config.broker.deployment;
+    match deployment {
+        Deployment::Separated if !(hardening.not_dumpable && hardening.no_core) => {
+            return Err(format!(
+                "cannot make this process's memory private to it ({hardening:?}); a separated \
+                 deployment does not start without that"
+            )
+            .into());
+        }
+        Deployment::Separated => {}
+        Deployment::Development => eprintln!(
+            "keygate: WARNING: development deployment. Any process of uid {uid} can read the \
+             master key, and plain-http loopback upstreams are allowed. Not for shared hosts."
+        ),
+    }
+    let grace = Duration::from_millis(config.broker.shutdown_grace_ms);
+    let reachable_by_others = config.broker.socket_mode & 0o077 != 0;
+    let gateway = config.broker.http_listen.is_some();
     let broker = Broker::open(state, config, BrokerOptions::default())?;
     let listeners = Listeners::bind(&broker).await?;
     let socket_path = listeners.socket_path.clone();
-    eprintln!("keygate: listening on {}", socket_path.display());
+    eprintln!(
+        "keygate: listening on {} as uid {uid} ({} deployment)",
+        socket_path.display(),
+        broker.status_deployment()
+    );
     if let Some(addr) = listeners.http_addr {
         eprintln!("keygate: loopback gateway on http://{addr}");
+    }
+    if deployment == Deployment::Separated && !reachable_by_others && !gateway {
+        eprintln!(
+            "keygate: note: the socket is private to uid {uid}, which is not served as a caller; \
+             set socket/socket_mode (or http_listen) so callers under other uids can connect"
+        );
     }
     for row in broker.rows() {
         eprintln!(
@@ -315,10 +390,17 @@ async fn serve(state: &Path) -> Fallible<()> {
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let outcome = tokio::select! {
-        served = listeners.run(broker) => served.map_err(Into::into),
+        served = listeners.run(broker.clone()) => served.map_err(Into::into),
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
     };
+    // The listeners are gone. Cut what is in flight and give each call a
+    // moment to record how it ended; what does not make it is `InFlight`
+    // on disk and comes back `Uncertain`, never re-sent.
+    let unrecorded = broker.shutdown(grace).await;
+    if unrecorded > 0 {
+        eprintln!("keygate: {unrecorded} call(s) did not record an outcome before exit; they will be Uncertain");
+    }
     let _ = std::fs::remove_file(&socket_path);
     outcome
 }
@@ -328,6 +410,7 @@ async fn set(
     namespace: Namespace,
     row: String,
     cut_existing: bool,
+    forget_retired: bool,
 ) -> Fallible<()> {
     use base64::Engine;
     let mut secret = Vec::new();
@@ -342,6 +425,7 @@ async fn set(
         row,
         secret_b64,
         cut_existing,
+        forget_retired,
     };
     let response = client.call(&request).await;
     if let Request::Set { secret_b64, .. } = &mut request {
@@ -356,14 +440,21 @@ async fn run(cli: Cli) -> Fallible<ExitCode> {
     let Cli {
         state,
         socket,
+        broker_uid,
         command,
     } = cli;
+    let target = Target {
+        state,
+        socket,
+        broker_uid,
+    };
+    let state = &target.state;
     match command {
-        Command::Init => init(state_dir(&state)?)?,
-        Command::Serve => serve(state_dir(&state)?).await?,
+        Command::Init => init(state_dir(state)?)?,
+        Command::Serve => serve(state_dir(state)?).await?,
         Command::Attenuate { token, caveats } => {
             let narrowed = caveats
-                .caveats()
+                .caveats()?
                 .into_iter()
                 .try_fold(MacaroonV1::decode(&token.load()?)?, MacaroonV1::attenuate)?;
             println!("{}", narrowed.encode());
@@ -379,60 +470,81 @@ async fn run(cli: Cli) -> Fallible<ExitCode> {
             }))?;
         }
         Command::Hello => {
-            let mut client = connect(&socket, &state).await?;
+            let mut client = connect(&target).await?;
             print_json(&accepted(client.call(&Request::Hello).await?)?)?;
         }
         Command::Ls => {
-            let mut client = connect(&socket, &state).await?;
+            let mut client = connect(&target).await?;
             if let Response::Rows { rows } = accepted(client.call(&Request::Ls).await?)? {
                 for row in rows {
                     println!(
-                        "{}\t{}\t{}\tgen={}\tfloor={}\t{}",
+                        "{}\t{}\t{}\tgen={}\tfloor={}\tretired={}\t{}",
                         row.namespace,
                         row.row,
                         row.state,
                         row.generation,
                         row.revoked_floor,
+                        row.retired,
                         row.origin
                     );
                 }
             }
         }
         Command::Status => {
-            let mut client = connect(&socket, &state).await?;
+            let mut client = connect(&target).await?;
             print_json(&accepted(client.call(&Request::Status).await?)?)?;
         }
         Command::Set {
             namespace,
             row,
             cut_existing,
+            forget_retired,
         } => {
-            let mut client = connect(&socket, &state).await?;
-            set(&mut client, namespace, row, cut_existing).await?;
+            let mut client = connect(&target).await?;
+            set(&mut client, namespace, row, cut_existing, forget_retired).await?;
         }
-        Command::Revoke { namespace, row } => {
-            let mut client = connect(&socket, &state).await?;
-            accepted(client.call(&Request::Revoke { namespace, row }).await?)?;
+        Command::Revoke {
+            namespace,
+            row,
+            forget,
+        } => {
+            let mut client = connect(&target).await?;
+            let request = Request::Revoke {
+                namespace,
+                row,
+                forget,
+            };
+            accepted(client.call(&request).await?)?;
             println!("revoked");
+            if !forget {
+                println!(
+                    "the old secret is still withheld from responses; `keygate forget` drops it"
+                );
+            }
+        }
+        Command::Forget { namespace, row } => {
+            let mut client = connect(&target).await?;
+            accepted(client.call(&Request::Forget { namespace, row }).await?)?;
+            println!("forgotten");
         }
         Command::RevokeSeat { seat } => {
-            let mut client = connect(&socket, &state).await?;
+            let mut client = connect(&target).await?;
             accepted(client.call(&Request::RevokeSeat { seat }).await?)?;
             println!("revoked");
         }
         Command::Mint { seat, uid, caveats } => {
-            let mut client = connect(&socket, &state).await?;
+            let mut client = connect(&target).await?;
             let request = Request::MintMacaroon {
                 seat,
                 allowed_uid: uid,
-                caveats: caveats.caveats(),
+                caveats: caveats.caveats()?,
             };
             if let Response::Token { token } = accepted(client.call(&request).await?)? {
                 println!("{token}");
             }
         }
         Command::Authorize { call, stream } => {
-            let mut client = connect(&socket, &state).await?;
+            let mut client = connect(&target).await?;
             let (namespace, call) = call.into_call()?;
             let request = match namespace {
                 Namespace::Provider => Request::ProviderAuthorize(call),
@@ -441,7 +553,7 @@ async fn run(cli: Cli) -> Fallible<ExitCode> {
             print_json(&accepted(client.call(&request).await?)?)?;
         }
         Command::Forward { call } => {
-            let mut client = connect(&socket, &state).await?;
+            let mut client = connect(&target).await?;
             let (namespace, call) = call.into_call()?;
             let request = match namespace {
                 Namespace::Provider => Request::ProviderForward(call),
@@ -460,7 +572,7 @@ async fn run(cli: Cli) -> Fallible<ExitCode> {
             }
         }
         Command::Stream { call } => {
-            let mut client = connect(&socket, &state).await?;
+            let mut client = connect(&target).await?;
             let (namespace, call) = call.into_call()?;
             let request = match namespace {
                 Namespace::Provider => Request::ProviderStream(call),

@@ -1,14 +1,21 @@
 //! The opt-in loopback HTTP gateway.
 //!
-//! `/v1/provider/<row>/<path>` and `/v1/service/<row>/<path>` with
-//! `Authorization: Bearer kgm_<macaroon>` (or `x-api-key: kgm_<macaroon>`,
-//! which is where the Anthropic SDK puts its key). An unmodified SDK works
-//! by pointing its base URL at `http://127.0.0.1:<port>/v1/provider/<row>`
-//! and using the macaroon as its API key.
+//! `/v1/provider/<row>/<path>` and `/v1/service/<row>/<path>` with the
+//! macaroon where an SDK puts its API key: `Authorization: Bearer kgm_...`,
+//! `x-api-key: kgm_...` (Anthropic) or `x-goog-api-key: kgm_...`. An
+//! unmodified SDK works by pointing its base URL at
+//! `http://127.0.0.1:<port>/v1/provider/<row>` and using the macaroon as
+//! its API key. A token in the URL query is refused: URLs are logged.
 //!
 //! TCP offers no peer credentials, so callers here have no uid and
 //! uid-bound macaroons are refused. Headers the row does not allow are
 //! dropped rather than refused, because SDKs send many.
+//!
+//! Nothing is buffered for an unauthenticated peer: the token and route
+//! are verified from the request head, the body is then limited to what
+//! that token may send to that row (and refused from `Content-Length`
+//! alone when it announces more), and both the head and the body must
+//! arrive within `request_read_timeout_ms`.
 
 use crate::engine::{Broker, Caller, HeaderMode, StreamItem, StreamOutcome};
 use bytes::Bytes;
@@ -17,7 +24,7 @@ use hyper::body::{Body, Frame, Incoming};
 use hyper::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use keygate_core::journal::{CallKind, TicketId};
 use keygate_core::macaroon::TOKEN_PREFIX;
 use keygate_core::proto::{Call, Code, Refusal};
@@ -32,10 +39,12 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
 
-/// Hard ceiling on a gateway request body; rows set their own lower limits.
-const MAX_BODY_BYTES: usize = 32 << 20;
-const X_API_KEY: &str = "x-api-key";
-const REQUEST_ID_HEADERS: &[&str] = &["idempotency-key", "x-keygate-request-id"];
+/// Headers a token may arrive in. All are stripped before forwarding.
+const TOKEN_HEADERS: &[&str] = &["authorization", "x-api-key", "x-goog-api-key"];
+const IDEMPOTENCY_KEY: &str = "idempotency-key";
+const KEYGATE_REQUEST_ID: &str = "x-keygate-request-id";
+/// Largest request head (request line and headers) the gateway reads.
+const MAX_HEAD_BYTES: usize = 128 << 10;
 
 type GatewayBody = Either<Full<Bytes>, RelayBody>;
 
@@ -71,8 +80,13 @@ pub async fn serve(broker: Broker, listener: TcpListener) -> io::Result<()> {
                 let broker = broker.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let head_deadline =
+                        Duration::from_millis(broker.config().request_read_timeout_ms);
                     let service = service_fn(move |request| handle(broker.clone(), request));
                     let _ = hyper::server::conn::http1::Builder::new()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(head_deadline)
+                        .max_buf_size(MAX_HEAD_BYTES)
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
                 });
@@ -105,6 +119,24 @@ async fn route(
     // pass `plain_path` like any other.
     let (ns, row, path) = split_route(parts.uri.path())?;
     let token = bearer(&parts.headers)?;
+    let caller = Caller { uid: None };
+
+    // Before a single body byte is read: is this token good for this row,
+    // and how much may it send?
+    let limit = broker.preauthorize(ns, row, &token, caller)?;
+    let announced = parts
+        .headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(announced) = announced.filter(|len| *len > limit as u64) {
+        return Err(Refusal::new(
+            Code::TooLarge,
+            format!(
+                "request announces {announced} bytes; this token may send {limit} to {ns}/{row}"
+            ),
+        ));
+    }
 
     let mut headers = Vec::new();
     let mut request_id = None;
@@ -118,28 +150,40 @@ async fn route(
         })
         .transpose()?;
     for (name, value) in &parts.headers {
-        if name == AUTHORIZATION || name.as_str() == X_API_KEY || name.as_str() == "last-event-id" {
+        if TOKEN_HEADERS.contains(&name.as_str()) || name.as_str() == "last-event-id" {
             // The macaroon never travels upstream.
             continue;
         }
         let Ok(value) = value.to_str() else { continue };
-        if REQUEST_ID_HEADERS.contains(&name.as_str()) {
-            request_id = Some(value.to_owned());
-            continue;
+        match name.as_str() {
+            KEYGATE_REQUEST_ID => {
+                request_id = Some(value.to_owned());
+                continue;
+            }
+            // Identifies the request to keygate and, where the row allows
+            // the header, to the upstream as well.
+            IDEMPOTENCY_KEY => request_id = request_id.or_else(|| Some(value.to_owned())),
+            _ => {}
         }
         headers.push((name.as_str().to_owned(), value.to_owned()));
     }
 
-    let body = Limited::new(body, MAX_BODY_BYTES)
-        .collect()
-        .await
-        .map_err(|e| {
-            Refusal::new(
+    let read_deadline = Duration::from_millis(broker.config().request_read_timeout_ms);
+    let body = match tokio::time::timeout(read_deadline, Limited::new(body, limit).collect()).await {
+        Ok(Ok(body)) => body.to_bytes(),
+        Ok(Err(e)) => {
+            return Err(Refusal::new(
                 Code::TooLarge,
-                format!("request body unreadable or over {MAX_BODY_BYTES} bytes: {e}"),
-            )
-        })?
-        .to_bytes();
+                format!("request body unreadable or over the {limit} bytes this token may send to {ns}/{row}: {e}"),
+            ))
+        }
+        Err(_) => {
+            return Err(Refusal::new(
+                Code::Timeout,
+                "the request body was not delivered within the read deadline",
+            ))
+        }
+    };
 
     let kind = broker.classify(ns, row, path, &body)?;
     let method = parts.method.as_str().to_owned();
@@ -164,7 +208,6 @@ async fn route(
         request_id,
         last_event_id,
     };
-    let caller = Caller { uid: None };
 
     match kind {
         CallKind::Buffered => {
@@ -216,16 +259,14 @@ fn split_route(path: &str) -> Result<(Namespace, &str, &str), Refusal> {
     Ok((ns, row, upstream_path))
 }
 
+/// The macaroon, from wherever an SDK put its API key.
 fn bearer(headers: &hyper::HeaderMap) -> Result<String, Refusal> {
-    let from_authorization = headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.strip_prefix("Bearer ")
-                .or_else(|| v.strip_prefix("bearer "))
-        });
-    let from_api_key = headers.get(X_API_KEY).and_then(|v| v.to_str().ok());
-    [from_authorization, from_api_key]
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let from_authorization = text(AUTHORIZATION.as_str()).and_then(|v| {
+        v.strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+    });
+    [from_authorization, text("x-api-key"), text("x-goog-api-key")]
         .into_iter()
         .flatten()
         .map(str::trim)
@@ -234,7 +275,7 @@ fn bearer(headers: &hyper::HeaderMap) -> Result<String, Refusal> {
         .ok_or_else(|| {
             Refusal::new(
                 Code::BadToken,
-                "expected `Authorization: Bearer kgm_<macaroon>`",
+                "expected `Authorization: Bearer kgm_<macaroon>` (or the macaroon in x-api-key / x-goog-api-key)",
             )
         })
 }
@@ -360,7 +401,9 @@ mod tests {
             bearer(&headers).is_err(),
             "a raw key is not a keygate token"
         );
-        headers.insert(X_API_KEY, HeaderValue::from_static("kgm_abc"));
+        headers.insert("x-goog-api-key", HeaderValue::from_static("kgm_goog"));
+        assert_eq!(bearer(&headers).unwrap(), "kgm_goog");
+        headers.insert("x-api-key", HeaderValue::from_static("kgm_abc"));
         assert_eq!(bearer(&headers).unwrap(), "kgm_abc");
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer kgm_xyz"));
         assert_eq!(bearer(&headers).unwrap(), "kgm_xyz");

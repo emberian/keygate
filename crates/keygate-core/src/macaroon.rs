@@ -23,6 +23,7 @@ const VERSION: u8 = 1;
 const ROOT_DOMAIN: &[u8] = b"keygate-macaroon/v1\0root";
 const CAVEAT_DOMAIN: &[u8] = b"keygate-macaroon/v1\0caveat";
 const SCOPE_CONTEXT: &str = "keygate-macaroon/v1 spend scope id";
+const OWNER_CONTEXT: &str = "keygate-macaroon/v1 ticket owner id";
 /// Context for deriving the macaroon root key from the master key.
 pub const ROOT_KEY_CONTEXT: &str = "keygate-macaroon/v1 root key";
 
@@ -118,6 +119,10 @@ pub struct Verified {
     pub root: RootId,
     pub caveats: Vec<Caveat>,
     pub spend_scopes: Vec<SpendScope>,
+    /// Identifies this exact token (root binding and every caveat): a hash
+    /// of the verified final tag. Tickets are owned by it, so a different
+    /// token of the same seat can neither find nor replay them.
+    pub owner: [u8; 32],
 }
 
 impl MacaroonV1 {
@@ -220,6 +225,7 @@ impl MacaroonV1 {
             root: self.root.clone(),
             caveats: self.caveats.clone(),
             spend_scopes,
+            owner: blake3::derive_key(OWNER_CONTEXT, &*tag),
         })
     }
 }
@@ -247,6 +253,53 @@ impl std::fmt::Debug for MacaroonV1 {
 }
 
 impl Verified {
+    /// The earliest `ExpiresAtUnixS` on the token, if it has one.
+    pub fn expires_at_unix_s(&self) -> Option<u64> {
+        self.caveats
+            .iter()
+            .filter_map(|c| match c {
+                Caveat::ExpiresAtUnixS(at) => Some(*at),
+                _ => None,
+            })
+            .min()
+    }
+
+    /// Check the caveats that depend only on who is calling which row and
+    /// when: `Seat`, `Namespace`, `Rows`, `ExpiresAtUnixS`. Transports use
+    /// this to turn a caller away before reading its request body; the
+    /// full [`Verified::admit`] still runs afterwards.
+    pub fn admit_route(
+        &self,
+        namespace: Namespace,
+        row: &str,
+        now_unix_s: u64,
+    ) -> Result<(), CaveatDenied> {
+        for (index, caveat) in self.caveats.iter().enumerate() {
+            let reason = match caveat {
+                Caveat::Seat(seat) if *seat != self.root.seat => format!("seat is not {seat:?}"),
+                Caveat::Namespace(ns) if *ns != namespace => format!("namespace is not {ns}"),
+                Caveat::Rows(rows) if !rows.iter().any(|r| r == row) => {
+                    format!("row {row:?} not in {rows:?}")
+                }
+                Caveat::ExpiresAtUnixS(at) if now_unix_s >= *at => format!("expired at {at}"),
+                _ => continue,
+            };
+            return Err(CaveatDenied { index, reason });
+        }
+        Ok(())
+    }
+
+    /// The tightest `MaxRequestBytes` on the token, if it has one.
+    pub fn max_request_bytes(&self) -> Option<usize> {
+        self.caveats
+            .iter()
+            .filter_map(|c| match c {
+                Caveat::MaxRequestBytes(max) => Some(*max),
+                _ => None,
+            })
+            .min()
+    }
+
     /// Check every stateless caveat against `facts`. Spend ceilings are
     /// stateful and are enforced by the ticket journal via `spend_scopes`.
     pub fn admit(&self, facts: &Facts<'_>) -> Result<(), CaveatDenied> {
@@ -763,6 +816,91 @@ mod tests {
         .attenuate(Caveat::MaxSpendMicroUsd(10))
         .unwrap();
         assert_ne!(p, other_root.verify(&KEY).unwrap().spend_scopes);
+    }
+
+    /// #tooth: the ticket-owner id is per exact token. Attenuating changes
+    /// it, re-deriving the same token reproduces it, and it is not the tag.
+    #[test]
+    fn tooth_owner_id_is_per_token_and_hides_the_tag() {
+        let parent = build(vec![Caveat::MaxSpendMicroUsd(10)]);
+        let child = parent
+            .clone()
+            .attenuate(Caveat::Methods(vec!["POST".into()]))
+            .unwrap();
+        let p = parent.verify(&KEY).unwrap();
+        let c = child.verify(&KEY).unwrap();
+        assert_ne!(p.owner, c.owner);
+        assert_eq!(
+            p.spend_scopes, c.spend_scopes,
+            "spend scope is shared, ownership is not"
+        );
+        assert_eq!(
+            p.owner,
+            MacaroonV1::decode(&parent.encode())
+                .unwrap()
+                .verify(&KEY)
+                .unwrap()
+                .owner
+        );
+        assert_ne!(p.owner, parent.tag);
+        assert_ne!(p.owner, p.spend_scopes[0].id);
+        let other_root = MacaroonV1::mint(
+            &KEY,
+            RootId {
+                nonce: [1u8; 16],
+                ..root()
+            },
+        )
+        .attenuate(Caveat::MaxSpendMicroUsd(10))
+        .unwrap();
+        assert_ne!(p.owner, other_root.verify(&KEY).unwrap().owner);
+
+        let t = build(vec![
+            Caveat::ExpiresAtUnixS(900),
+            Caveat::MaxRequestBytes(50),
+            Caveat::ExpiresAtUnixS(700),
+            Caveat::MaxRequestBytes(80),
+        ]);
+        let v = t.verify(&KEY).unwrap();
+        assert_eq!(
+            (v.expires_at_unix_s(), v.max_request_bytes()),
+            (Some(700), Some(50))
+        );
+        assert_eq!((p.expires_at_unix_s(), p.max_request_bytes()), (None, None));
+
+        let routed = build(vec![
+            Caveat::Namespace(Namespace::Service),
+            Caveat::Rows(vec!["gh".into()]),
+            Caveat::Models(vec!["m".into()]),
+            Caveat::ExpiresAtUnixS(900),
+        ])
+        .verify(&KEY)
+        .unwrap();
+        assert!(
+            routed.admit_route(Namespace::Service, "gh", 899).is_ok(),
+            "body caveats wait for the body"
+        );
+        assert_eq!(
+            routed
+                .admit_route(Namespace::Provider, "gh", 899)
+                .unwrap_err()
+                .index,
+            0
+        );
+        assert_eq!(
+            routed
+                .admit_route(Namespace::Service, "api", 899)
+                .unwrap_err()
+                .index,
+            1
+        );
+        assert_eq!(
+            routed
+                .admit_route(Namespace::Service, "gh", 900)
+                .unwrap_err()
+                .index,
+            3
+        );
     }
 
     #[test]

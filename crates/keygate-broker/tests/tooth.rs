@@ -17,7 +17,7 @@ use keygate_core::journal::{self, CallKind, ClosedBy, TicketState};
 use keygate_core::macaroon::{Caveat, MacaroonV1};
 use keygate_core::proto::{Code, Request, Response, ServiceAuthorize};
 use keygate_core::seal::SealError;
-use keygate_core::{now_unix_s, Namespace};
+use keygate_core::Namespace;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -72,7 +72,9 @@ async fn secret_split_case(pieces: Vec<&'static [u8]>) {
     assert_eq!(next_chunk(&mut live).await, "data: ");
 
     for piece in pieces {
-        senders[0].send(Bytes::from_static(piece)).unwrap();
+        // The guard trips on the 16th secret byte, so with small pieces the
+        // upstream request can be gone before the last ones are sent.
+        let _ = senders[0].send(Bytes::from_static(piece));
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     // By now keygate may already have torn the upstream request down.
@@ -130,10 +132,11 @@ async fn tooth_near_miss_stream_is_delivered_complete() {
     let mut live = rig
         .live(S, call(&token, "api", "GET", "/events", b""))
         .await;
-    // A strict prefix of the secret, split, then the stream ends cleanly.
+    // Fragments of the secret below the 16-byte window, split across
+    // chunks, then the stream ends cleanly.
     for piece in [
         "event: x\ndata: sk-ant-",
-        "secret1234",
+        "secret12",
         "\n\ndata: sk-ant-sec",
     ] {
         senders[0].send(bytes(piece)).unwrap();
@@ -143,7 +146,7 @@ async fn tooth_near_miss_stream_is_delivered_complete() {
     let (delivered, summary) = drain(&mut live).await;
     assert_eq!(
         delivered,
-        b"event: x\ndata: sk-ant-secret1234\n\ndata: sk-ant-sec"
+        b"event: x\ndata: sk-ant-secret12\n\ndata: sk-ant-sec"
     );
     assert!(summary.complete && !summary.withheld);
     assert_eq!(summary.closed_by, ClosedBy::UpstreamEof);
@@ -499,7 +502,7 @@ async fn tooth_revoke_cuts_live_stream_within_50ms_and_rotation_does_not() {
         (ended, Instant::now())
     });
     let revoked_at = Instant::now();
-    rig.broker.revoke(S, "api", OPERATOR).unwrap();
+    rig.broker.revoke(S, "api", false, OPERATOR).unwrap();
     let ((rest, summary), cut_at) = tokio::time::timeout(WAIT, cut)
         .await
         .expect("stream survived revoke")
@@ -789,6 +792,7 @@ async fn tooth_audit_failure_refuses_before_any_upstream_connection() {
     let read_only = AuditLog::from_file(std::fs::File::open(&audit_path).unwrap());
     let rig = rig.reopen(BrokerOptions {
         audit: Some(read_only),
+        ..Default::default()
     });
 
     let post = call(
@@ -842,6 +846,7 @@ async fn tooth_audit_failure_refuses_before_any_upstream_connection() {
                 "api",
                 keygate_core::secret::SecretBytes::new(b"sk-new-key-000001".to_vec()),
                 false,
+                false,
                 OPERATOR
             )
             .unwrap_err()
@@ -871,7 +876,7 @@ async fn tooth_provider_and_service_tables_are_disjoint() {
         r#"
 [providers.shared]
 origin = "{}"
-paths = ["/v1/messages"]
+dialect = "anthropic-messages"
 models = ["m-small"]
 max_output_tokens = 1000
 
@@ -942,7 +947,7 @@ buffered_paths = ["/v1/messages"]
     assert!(rig.forward(P, pinned).await.is_ok());
 
     // Revoking one table's row leaves the other's alone.
-    rig.broker.revoke(P, "shared", OPERATOR).unwrap();
+    rig.broker.revoke(P, "shared", false, OPERATOR).unwrap();
     let mut after = call(&token, "shared", "POST", "/v1/messages", &body);
     after.request_id = Some("after".into());
     assert_eq!(
@@ -962,7 +967,7 @@ buffered_paths = ["/v1/messages"]
     .unwrap();
     let boot = Broker::open(
         dir.path(),
-        Config::parse(&config).unwrap(),
+        Config::parse(&development(&config)).unwrap(),
         BrokerOptions::default(),
     );
     assert!(matches!(
@@ -1427,6 +1432,7 @@ async fn tooth_unix_socket_protocol_end_to_end() {
         row: "api".into(),
         secret_b64: STANDARD.encode(SECRET),
         cut_existing: false,
+        forget_retired: false,
     };
     assert!(matches!(client.call(&set).await.unwrap(), Response::Ok));
     let short = Request::Set {
@@ -1434,6 +1440,7 @@ async fn tooth_unix_socket_protocol_end_to_end() {
         row: "api".into(),
         secret_b64: STANDARD.encode("short"),
         cut_existing: false,
+        forget_retired: false,
     };
     assert!(
         matches!(client.call(&short).await.unwrap(), Response::Error(r) if r.code == Code::BadRequest)
@@ -1564,7 +1571,8 @@ async fn tooth_unix_socket_protocol_end_to_end() {
         client
             .call(&Request::Revoke {
                 namespace: S,
-                row: "api".into()
+                row: "api".into(),
+                forget: false,
             })
             .await
             .unwrap(),
@@ -1612,6 +1620,7 @@ async fn tooth_unix_socket_protocol_end_to_end() {
         Request::Revoke {
             namespace: S,
             row: "api".into(),
+            forget: false,
         },
         Request::RevokeSeat {
             seat: "seat-a".into(),
@@ -1626,6 +1635,7 @@ async fn tooth_unix_socket_protocol_end_to_end() {
         row: "api".into(),
         secret_b64: STANDARD.encode("attacker-key-00001"),
         cut_existing: true,
+        forget_retired: false,
     };
     assert!(
         matches!(client.call(&set).await.unwrap(), Response::Error(r) if r.code == Code::NotOperator)
@@ -1913,6 +1923,7 @@ async fn tooth_secrets_are_sealed_at_rest_and_short_ones_refused() {
             "api",
             keygate_core::secret::SecretBytes::new(secret.to_vec()),
             false,
+            false,
             OPERATOR,
         )
     };
@@ -1931,6 +1942,7 @@ async fn tooth_secrets_are_sealed_at_rest_and_short_ones_refused() {
                 S,
                 "nope",
                 keygate_core::secret::SecretBytes::new(b"long-enough-key".to_vec()),
+                false,
                 false,
                 OPERATOR
             )
@@ -1970,7 +1982,7 @@ async fn tooth_completion_count_is_capped_and_reserved() {
             Code::TokenCapRefused
         );
     }
-    for n in ["-1", "1.5", "null", "\"2\""] {
+    for n in ["-1", "1.5", "\"2\""] {
         let body = format!(r#"{{"model":"m-small","max_tokens":1,"n":{n}}}"#);
         assert_eq!(
             rig.forward(
@@ -2018,9 +2030,9 @@ async fn tooth_cache_and_stream_usage_settle_exactly() {
     let cfg = config(&up.origin)
         .replace(
             "output_micro_usd_per_mtok = 1000000",
-            "input_micro_usd_per_mtok = 1000000\noutput_micro_usd_per_mtok = 2000000",
+            "input_micro_usd_per_mtok = 1000000\noutput_micro_usd_per_mtok = 2000000\ncache_write_micro_usd_per_mtok = 1250000\ncache_read_micro_usd_per_mtok = 100000",
         )
-        .replace("per_day_micro_usd = 2500", "per_day_micro_usd = 10000");
+        .replace("per_day_micro_usd = 2500", "per_day_micro_usd = 100000");
     let rig = Rig::new(&cfg);
     let token = rig.token("seat-a");
     let reply = rig
@@ -2036,12 +2048,14 @@ async fn tooth_cache_and_stream_usage_settle_exactly() {
         )
         .await
         .unwrap();
+    // 1 input at 1, 20 cache writes at 1.25, 300 cache reads at 0.1, 4
+    // output at 2 micro-USD per token: 1 + 25 + 30 + 8.
     assert_eq!(
         rig.broker.ticket(reply.ticket).unwrap().reserved_micro_usd,
-        329
+        64
     );
     let fixtures = [
-        ("event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":20,\"cache_read_input_tokens\":300,\"output_tokens\":0}}}\r\n\r\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", 329),
+        ("event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":20,\"cache_read_input_tokens\":300,\"output_tokens\":0}}}\r\n\r\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", 64),
         ("data: {\"choices\":[],\"usage\":null}\n\ndata: {\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":10}}}\n\ndata: [DONE]\n\n", 26),
     ];
     for ((fixture, expected), sender) in fixtures.into_iter().zip(senders) {
@@ -2073,7 +2087,7 @@ async fn tooth_cache_and_stream_usage_settle_exactly() {
     assert_eq!(
         rig.broker
             .spent(&journal::row_day_key("llm", journal::utc_day(now_unix_s()))),
-        329 + 329 + 26
+        64 + 64 + 26
     );
 }
 
@@ -2231,7 +2245,10 @@ async fn tooth_revoke_seat_audit_failure_is_reported() {
     let rig = Rig::new(&config(&up.origin));
     let token = rig.token("seat-a");
     let audit = AuditLog::from_file(std::fs::File::open(rig.state().join("audit.log")).unwrap());
-    let rig = rig.reopen(BrokerOptions { audit: Some(audit) });
+    let rig = rig.reopen(BrokerOptions {
+        audit: Some(audit),
+        ..Default::default()
+    });
     let refusal = rig.broker.revoke_seat("seat-a", OPERATOR).unwrap_err();
     assert_eq!(refusal.code, Code::AuditFailed);
     assert!(refusal.message.contains("IS revoked"));

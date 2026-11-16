@@ -1,71 +1,140 @@
 # `keygate` Specification (`SPEC.md`)
 
-A standalone, zero-slop Rust capability-membrane & streaming secret custody broker for multi-agent fleets (`fleet`), multi-tenant cloud sandboxes (`builders.dev`), and `obend` residents.
+A Rust broker that holds upstream credentials (LLM provider keys, service tokens) and lets callers use them through attenuable capability tokens, for buffered and streamed HTTP exchanges.
 
-Eliminates:
-1. Plaintext API keys / OAuth tokens / MCP bearers inside agent-readable files or container environments.
-2. Co-UID impersonation (`SO_PEERCRED` alone is insufficient when multiple processes/shells share a container UID — `keygate` layers **attenuated BLAKE3 Macaroons** modeled directly as the wire subset of `Obend.Vault.Form` capability membranes).
-3. `mini-keys`'s non-streaming LLM blocker, `curl` 20ms sleep-poll latency, `_pool` namespace collisions, `O(N)` ticket directory scans, and 1 Hz disk-decrypt stream polling.
+This document states what the implementation does. Where a number is a design goal rather than a measurement it says so; measurements and the audit trail are in [HARDENING.md](HARDENING.md).
 
----
+## 0. What keygate does and does not protect
 
-## 1. Core Architecture & Capabilities
+keygate removes these from a caller's environment:
 
-### 1.1 Dual Credential Namespaces (Strictly Disjoint)
-- **`providers/` (`Namespace::Provider`)**: Metered LLM/inference upstreams (Anthropic, OpenAI, Gemini, OpenRouter, custom compatible endpoints) enforcing JSON body model allowlists, `max_tokens` / aggregate output-token caps (including `n`, limited to 1–16), per-call and per-day micro-USD spend ceilings, and per-seat fairness shares. Supports **both** `provider-forward` (whole JSON reply with exact-retry replay) and **`provider-stream`** (live SSE token streaming so real Claude Code / Codex / Gemini CLI turns run through `keygate` with zero raw keys in the sandbox!).
-- **`services/` (`Namespace::Service`)**: Arbitrary HTTPS (or loopback HTTP) APIs & event streams (e.g. `mcp.builders.dev`, GitHub REST/GraphQL, webhook endpoints). Each service row configures:
-  - Single `origin` (`https://host[:port]`, `http://127.0.0.1[:port]` / `[::1]` only for loopback).
-  - Canonical `plain_path` segment prefixes split into `buffered_paths` (whole-reply journaled + replayable) and `stream_paths` (SSE / chunked streaming, retaining closing summary + `Last-Event-ID` reconnect support).
-  - Allows `/` as the zero-segment root path; refuses `%`, `.`, `..`, empty segments in other paths, fragments, and unauthorized headers (preventing proxy/router path-normalization differentials; allows only fixed safe headers + configured caller header allowlist such as `Last-Event-ID`).
-- Both tables are optional independently (a broker with only `services` or only `providers` boots cleanly; neither configured refuses at startup). Secrets are sealed at rest with `ChaCha20Poly1305` (or AES-256-GCM) under a `0600` master key with domain-separated AAD `("keygate-seal/v1", namespace, row_name)`.
+1. Plaintext API keys, OAuth tokens and bearers in files or environment variables the caller can read.
+2. The need to give every caller the same unrestricted credential: each caller holds a macaroon that restricts seat, namespace, rows, methods, paths, models, request size, spend and lifetime.
+3. Polling: upstream I/O is native async, revocation is an in-memory notification, and ticket lookup is a hash probe.
 
-### 1.2 Attenuated Capability Membranes (`Macaroon` + OS Peer Creds)
-- Over Unix domain sockets (`SO_PEERCRED` on Linux, `getpeereid` on macOS) *and* optional loopback HTTP proxy mode (`http://127.0.0.1:<port>` for drop-in `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` / `HTTPS_PROXY`-style base-URL routing inside containers using `Authorization: Bearer kgm_<macaroon>`!):
-  - Operator mints a root capability token for a `seat_id` bound to `(allowed_uid_opt, root_epoch)` using chained `BLAKE3` keyed MACs (`MacaroonV1`).
-  - Anyone holding a macaroon can **attenuate** it offline by appending caveats (never widening!):
-    - `Seat(String)`
-    - `Namespace(Provider | Service)`
-    - `Rows(Vec<String>)`
-    - `Methods(Vec<String>)`
-    - `PathPrefixes(Vec<String>)`
-    - `Models(Vec<String>)`
-    - `MaxRequestBytes(usize)`
-    - `MaxSpendMicroUsd(u64)`
-    - `ExpiresAtUnixS(u64)`
-  - Designed as a strict 1-to-1 first-order subset of `Obend.Vault.Form` residual predicates so future `obend` membrane proofs compile directly to `keygate` caveats.
+It relies on, and does not replace, an operating-system boundary:
 
-### 1.3 Multi-Secret Cross-Chunk Prefix-Holdback Stream Scrubber (`EchoGuard`)
-- An upstream error page, debug echo, or prompt-injected reflection must **never** leak a sealed bearer back to the caller — even if the secret spans two network read chunks!
-- `EchoGuard` builds an automaton (Aho-Corasick / multi-pattern prefix matcher) over active sealed secret bytes (`>= 8` bytes):
-  - Scans response status/headers whole before emitting the head frame.
-  - On streaming body chunks, emits safe prefix bytes immediately while holding back *only* the longest trailing suffix (`< secret.len()`) that matches a prefix of any guarded secret.
-  - If a full match occurs across chunk boundaries, **immediately cuts the stream before emitting a single byte of the secret**, zeroes internal buffers, kills the upstream request, and emits a terminal `withheld: true` closing summary + audit event!
-
-### 1.4 O(1) Indexed Ticket Journal & `<100 µs` Zero-I/O Epoch Revocation
-- **Ticket Store**: Append-only WAL journal + in-memory `HashMap<(SeatId, RequestDigest32), TicketId>` index (compacted every `N` ops, `O(1)` lookup on `authorize` and `forward`, eliminating `O(N)` `read_dir` scans!).
-  - Exact retry of `authorize` returns the existing live ticket without double-counting budget. Unused `Live` reservations expire after `broker.live_ttl_s` (default 120 seconds); admission durably refunds expired reservations before enforcing budgets. Terminal tickets use the separate `retention_s` setting.
-  - Buffered replies and cleanly completed provider SSE streams settle to reported usage when complete counts are available. Anthropic cache-creation/read input counters contribute to input usage. Missing/malformed usage or an abnormal stream ending retains the reservation.
-  - Buffered `forward` retains the exact response for `retention_s` so lost-reply retries replay without double-billing or double-POSTing; caller disconnect mid-flight marks ticket `Uncertain` (never re-sent).
-  - Streaming `stream` (`provider-stream` / `service-stream`) retains the closing summary (`status, bytes, complete, withheld, revoked`) so retrying a spent stream ticket reports how it ended rather than silently opening a duplicate stream; reconnecting uses a fresh ticket (with optional `last_event_id`).
-- **Instant Epoch Revocation vs Smooth Rotation**:
-  - Each row holds a `tokio::sync::watch::Sender<RowEpoch { generation: u64, revoked_floor: u64 }>` in memory.
-  - `keygate revoke <ns> <row>` advances `revoked_floor`, waking every `tokio::select!` stream relay loop in **`<100 µs` with zero disk reads**, aborting the upstream stream and recording `closed_by: "revoked"`.
-  - `keygate revoke-seat <seat>` advances an in-memory watch epoch, cutting buffered calls and streams minted under an earlier seat epoch before persisting and auditing the revocation. Persistence or audit failures are explicit errors; in-memory revocation remains effective.
-  - `keygate set <ns> <row>` (routine key rotation) increments `generation` without advancing `revoked_floor` (unless `--cut-existing` is passed), so new requests use the new key while healthy in-flight streams finish undisturbed!
+- **The broker must run under its own uid, with its state directory private to that uid.** A process that shares the broker's uid can read the master key and needs no token. Macaroons and peer credentials decide which *request* is served; they do not isolate processes that can read the broker's files. A `separated` deployment (the default) refuses to serve a peer whose uid is the broker's own, so this misconfiguration fails loudly instead of appearing to work.
+- **The response guard is defense in depth.** It withholds reflections of a credential that match a bounded set of patterns (§1.3). It cannot stop an upstream that transforms a credential in a way outside that set.
+- **Spend limits are as good as the row's prices and the request's shape.** They bind for text-only requests on a priced row (§1.5). Features whose cost is not determined by the request body are refused unless the operator allows them, and then the limits are no longer bounds.
 
 ---
 
-## 2. Interfaces (Unix Socket Framing + Loopback HTTP Gateway + CLI)
+## 1. Architecture
 
-Each transport limits accepted connections with `broker.max_connections` (default 256). Durable operations run on a shared blocking pool with at most 16 jobs, leaving async relay workers available during disk stalls. Unix pipelining uses bounded read-ahead (one maximum frame plus its length prefix); exceeding that bound closes the connection.
+### 1.1 Two credential tables
 
-1. **Unix Socket Protocol**: Length-prefixed JSON frames supporting `hello`, `mint-macaroon`, `attenuate`, `provider-authorize`, `provider-forward`, `provider-stream`, `service-authorize`, `service-forward`, `service-stream`, and operator `set` / `revoke` / `ls` / `status`.
-2. **Loopback HTTP Gateway (`127.0.0.1` opt-in listener)**:
-   - A bare `/v1/<namespace>/<row>` or its trailing-slash form maps to upstream `/`, subject to row path policy. `Last-Event-ID` is forwarded only when allowed by the row; otherwise it is explicitly refused.
-   - Accepts `Authorization: Bearer kgm_<macaroon>` on `/v1/provider/<row>/...` and `/v1/service/<row>/...` so unmodified SDKs (`claude`, `codex`, `mcp-agent`, `agent-runner.mjs`) drop straight onto `keygate` by changing **only their base URL + swapping the raw API key for `kgm_<macaroon>`**!
-3. **Adversarial `#tooth` Tests**:
-   - Secret split across 2, 3, and 1-byte chunks (`"sk-ant-"` | `"secret1"` | `"2345"`) cut with **zero** secret bytes delivered to caller.
-   - Offline macaroon tampering (stripping a caveat or widening `MaxSpendMicroUsd`) rejected; offline attenuation narrowing path/TTL accepted.
-   - Live SSE stream cut within `<50 ms` on `revoke`, while a second stream under `set` (routine rotation) continues uninterrupted unless `--cut-existing` is specified.
-   - Buffered POST exact-retry replays cached response (`upstream_hits == 1`); mid-flight caller disconnect marks `Uncertain` and refuses replay.
-   - Audit-failure fault injection (`read-only` audit fd) refuses before any upstream TCP connection is made (`upstream_hits == 0`).
+`providers` and `services` are separate tables, each optional; a broker with neither refuses to start. A row named `x` may exist in both and they are unrelated: separate directories, separate sealing AAD.
+
+- **`providers`** (`Namespace::Provider`): metered LLM upstreams. Each row speaks one `dialect`:
+
+  | dialect | generation endpoint | output cap field |
+  |---|---|---|
+  | `anthropic-messages` | `POST /v1/messages` | `max_tokens` |
+  | `openai-chat` | `POST /v1/chat/completions` | `max_completion_tokens` or `max_tokens` |
+  | `openai-responses` | `POST /v1/responses` | `max_output_tokens` |
+
+  A row accepts `POST` at exactly one path: the dialect's endpoint, or the row's `endpoint` override for gateways that mount the same API under a prefix. The model and the output cap are read from the JSON body, so only APIs that select the model in the body are supported. **APIs that select the model in the URL path (Gemini `generateContent`, Bedrock `invoke`, Azure deployment paths) have no dialect and cannot be configured**; their OpenAI-compatible endpoints can, as `openai-chat` with an `endpoint`. `GET`/`HEAD` are allowed under the row's `read_paths` only.
+- **`services`** (`Namespace::Service`): other HTTPS APIs and event streams. Each row has one `origin`, allowed `methods`, and plain-path prefixes split into `buffered_paths` (whole reply, journaled, replayable) and `stream_paths` (SSE/chunked, with a retained closing summary).
+
+Common to both:
+
+- `origin` is `https://host[:port]`. Plain `http://127.0.0.1[:port]` / `http://[::1][:port]` is accepted only in a `development` deployment: loopback has no server identity, so any local process that binds the port first is sent the row's secret.
+- Paths are `plain_path`: `/` or `/seg/seg`, no `%`, no `.`/`..`, no empty segments, a fixed alphabet. The URL keygate sends must survive URL parsing byte-for-byte.
+- Caller headers are forwarded only if they are `accept`, `content-type`, or listed in the row's `caller_headers`. A row cannot list hop-by-hop headers, request-rewriting headers (`x-http-method-override`, `x-original-url`, `forwarded`, `x-forwarded-*`, ...), credential headers, or billing-identity headers (`openai-organization`, `openai-project`); the last group may be set by the operator in `fixed_headers`.
+- A keygate token is never sent upstream: a request whose query or forwarded headers contain `kgm_`, or whose body contains the presented token, is refused.
+- Secrets are sealed at rest with `ChaCha20Poly1305` under a `0600` master key, AAD `("keygate-seal/v1", namespace, row)`.
+
+### 1.2 Capability tokens (`MacaroonV1`)
+
+- The operator mints a root token for a seat, bound to `(allowed_uid?, root_epoch)`, with chained BLAKE3 keyed MACs.
+- Any holder can attenuate offline by appending caveats; all caveats must hold, so appending only narrows: `Seat`, `Namespace`, `Rows`, `Methods`, `PathPrefixes`, `Models`, `MaxRequestBytes`, `MaxSpendMicroUsd`, `ExpiresAtUnixS`.
+- `MaxSpendMicroUsd` is cumulative across the token and everything attenuated from it. It is enforced on priced provider rows; a token carrying it is refused on a provider row without prices, where the cap could not bind. Service calls are not metered.
+- `ExpiresAtUnixS` is checked at admission and also ends an open stream when it passes. A buffered call in progress is bounded by `buffered_timeout_ms` instead.
+- A clock that reads before 2025-06-15 or before the epoch is an error, not a zero: admission fails with `clock_failed`.
+- **Tickets belong to the exact token that opened them.** The request digest includes an id derived from the token's verified final tag and its spend scopes, so another token of the same seat, including one attenuated from the first, neither finds the first's reservation nor replays its retained reply.
+- Uid-bound tokens are checked against kernel peer credentials on the Unix socket and refused on the HTTP gateway, which has none.
+
+### 1.3 Response guard (`EchoGuard`)
+
+Goal: an upstream that reflects the injected credential (error page, debug echo, model output) should not get it past keygate, including across chunk boundaries.
+
+- **Patterns.** For each guarded secret: the secret, and each of these when it differs: percent-encoding with uppercase and with lowercase hex; JSON escaping of `"` and `\`; the same plus `\/`; the same plus `<`/`>`/`&`.
+- **Match.** Any 16 consecutive bytes of a pattern (the whole pattern if shorter). An echo that drops or alters characters still trips while a 16-byte run survives.
+- **Which secrets.** Every row's active secret, and its *retired* secrets: after `set` or `revoke` the previous secret is kept, sealed, as a guard-only pattern until the operator runs `forget` (at most 8 per row; a ninth rotation is refused until then, a revocation never is). A flight takes its secret and a guard containing that secret as one atomic pair and keeps both until it ends, so forgetting a secret never unguards a flight already sent with it.
+- **Streaming.** The longest suffix of the stream that is a substring of some pattern (at most 15 bytes) is held back; everything before it is forwarded at once. When a window completes, the stream is cut before any byte of that window was forwarded, the upstream request is aborted, and the closing summary says `withheld`.
+- **Head.** Status and headers are scanned whole before a head is emitted. A reply with a `Content-Encoding` other than `identity` is withheld, since it cannot be scanned (keygate requests `identity`).
+- **Bounds.** One suffix automaton over all patterns, sparse tables zeroed on drop, built outside any lock a request takes. Total pattern bytes are capped at 64 KiB; a `set` that would exceed the cap is refused and changes nothing.
+- **Limits.** Fewer than 16 consecutive bytes pass. Base64 or hex of the secret, case changes, compression and any other transformation pass. Case is never folded.
+
+### 1.4 Ticket journal
+
+Append-only WAL plus an in-memory `(seat, digest) -> ticket` index; lookups are `O(1)`.
+
+- Exact retry of `authorize` returns the existing ticket and is not charged again. Unused `Live` reservations expire after `live_ttl_s` and are refunded.
+- A buffered reply is retained for `retention_s` and replays on exact retry. A caller that disconnects mid-flight leaves the ticket `Uncertain`, which is never re-sent.
+- A stream ticket retains its closing summary (`status, bytes, complete, withheld, revoked, closed_by`); retrying it reports how it ended.
+- A ticket in flight at a crash comes back `Uncertain` and is retained for the full `retention_s`.
+- **Write failures.** Each record is appended and `fdatasync`ed before it takes effect in memory. A short write (disk full) is cut back to the last committed byte; that operation fails and the journal stays usable. If the cut-back fails, or `fdatasync` or a compaction's directory sync fails, the journal is poisoned: every later commit is refused until restart, and so is every call. The audit log cuts back torn lines the same way.
+- Audit-before-effect: `Begin` is appended and synced to the `0600` audit log before any upstream I/O; if that fails the call is refused.
+
+### 1.5 Budgets
+
+- Reservation for a generation request:
+  `(body_bytes + 4096) tokens at the dearest input price + output_cap * max(n, best_of) tokens at the output price`.
+  The dearest input price is the maximum of the input, cache-write (default twice input) and cache-read (default input) prices. A token is at least one byte of the request, so for a text-only request this is an upper bound at the row's prices, assuming at most 4096 tokens of provider-added prompt. `n` and `best_of` are limited to 1..=16. A request with no output cap is refused.
+- Complete replies settle to reported usage (input, cache-write, cache-read and output tokens at their own prices): buffered replies, and streams that end cleanly with complete usage. Anything else keeps the reservation.
+- Ceilings: `per_call_micro_usd`, `per_day_micro_usd`, `per_seat_day_micro_usd`, and `MaxSpendMicroUsd` scopes. A row with a ceiling and no prices is a config error.
+- Refused unless listed in the row's `allow`, because they make cost depend on more than the body:
+  `server-state` (`previous_response_id`, `conversation`, stored prompts, item references, file ids, containers, background runs), `remote-input` (images/documents fetched by URL), `server-tools` (provider-run tools, MCP connectors, web search), `premium-tier` (`service_tier: "priority"`, `speed: "fast"`), `inline-media` (inline images, documents, audio), `non-text-output` (`modalities` other than text, Chat Completions `audio`; billed on a channel the row's two token prices do not describe). With any of them allowed, the reservation is not a bound and settled spend can pass a ceiling. Objects stored at the provider belong to the upstream key, not to a seat: with `server-state` allowed, any seat on the row can reference another seat's.
+- The request body is parsed strictly: a duplicate key at any depth is refused, and an explicit `null` is treated as absent.
+
+### 1.6 Revocation, rotation, expiry, shutdown
+
+Every flight waits on in-memory `tokio::sync::watch` channels; nothing polls and nothing reads disk.
+
+- `revoke <ns> <row>` raises the row's `revoked_floor` first, in memory, then writes the tombstone. Open streams and in-flight calls on that row are cut. `revoke-seat` does the same for every token minted for a seat.
+- `set <ns> <row>` installs a new secret for new requests; flights already running finish on the old one unless `--cut-existing`.
+- A stream whose token expires is cut (`closed_by: expired`).
+- On `SIGTERM`/`SIGINT` the broker stops accepting, cuts every flight (`closed_by: shutdown`), waits up to `shutdown_grace_ms` for their outcomes to be journaled, and refuses new calls. A flight that does not make it is `InFlight` on disk and returns `Uncertain`.
+- Latency: the design goal is that the wake itself costs no I/O. The unit test asserts the notification (send to ready) completes within 100 µs; the integration test asserts a caller observes the cut within 50 ms. Measured figures are in HARDENING.md.
+
+---
+
+## 2. Deployment
+
+`[broker] deployment`:
+
+- **`separated`** (default). `operator_uids` must be listed. A peer whose uid is the broker's own is not served as a caller. Upstreams must be HTTPS. `keygate serve` sets umask 077, `RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0` (so the broker's own uid cannot `ptrace` it or read `/proc/<pid>/mem`) and refuses to start if it cannot. Linux only.
+- **`development`**. Single-uid experiments and tests: the state directory's owner is the operator, same-uid callers are served, plain-HTTP loopback upstreams are allowed. Any process of that uid can read the master key.
+
+Always:
+
+- The state directory must be a real directory owned by the broker's uid with mode `0700`, and **every directory above it** must be owned by that uid or root and not group- or world-writable (sticky directories such as `/tmp` excepted). A private leaf under a directory someone else can write can be renamed away and replaced. The broker resolves the path once and uses the canonical one.
+- `keygate.toml` must be a regular file owned by that uid or root, not group- or world-writable, under the same kind of path: whoever can write it chooses where secrets are sent.
+- Custody files are opened without following symlinks, without blocking on a FIFO, only if regular, and with bounded reads.
+- The socket is bound under a private name and renamed into place with its configured mode.
+
+`scripts/multiuid-acceptance.sh <keygate-binary>` checks the separated deployment between genuinely different kernel uids without host root: it runs the broker as one uid and callers as two others inside a private user namespace and verifies peer credentials, custody and the own-uid rule.
+
+What keygate cannot do for you: create the separate uid, make the socket reachable by callers (set `socket` and `socket_mode`, e.g. a group-readable socket in a root-owned directory), or stop a caller that has other access to the broker's uid.
+
+---
+
+## 3. Interfaces
+
+Each transport limits accepted connections (`max_connections`, default 256). Durable work runs on a blocking pool of at most 16 jobs.
+
+1. **Unix socket**: length-prefixed JSON frames: `hello`, `mint-macaroon`, `attenuate`, `present`, `provider-authorize|forward|stream`, `service-authorize|forward|stream`, and operator `set`, `revoke`, `revoke-seat`, `forget`, `ls`, `status`.
+   - Peer uid comes from the kernel (`SO_PEERCRED` / `getpeereid`).
+   - A connection may send frames of at most 64 KiB until it `present`s a token that verifies for a row; then up to that row's request size. Frame memory grows only as bytes arrive. A frame must complete within `request_read_timeout_ms`; an idle connection is closed after `idle_timeout_ms`.
+   - The client checks who is listening before sending anything. Told a broker uid (`--broker-uid`), it requires exactly that. Otherwise it trusts only a listener that is root or the client's own uid, that owns the socket file, at a path no one else could have rearranged (the same ancestor rule as above).
+2. **Loopback HTTP gateway** (opt-in, loopback addresses only): `/v1/provider/<row>/...` and `/v1/service/<row>/...` with the macaroon in `Authorization: Bearer`, `x-api-key` or `x-goog-api-key`. A token in the query is refused.
+   - The token and route are verified from the request head. The body is then limited to what that token may send to that row, refused from `Content-Length` alone when it announces more, and must arrive within `request_read_timeout_ms`, as must the head.
+   - `Idempotency-Key` (or `x-keygate-request-id`) identifies a request for deduplication; `Idempotency-Key` is also forwarded where the row allows it. Without one, only buffered non-GET calls are deduplicated.
+   - Upstream reply headers in `x-keygate-*`, hop-by-hop headers and headers named in `Connection` are not passed to the caller.
+3. **CLI**: `init`, `serve`, `hello`, `set` (secret on stdin), `revoke [--forget]`, `revoke-seat`, `forget`, `ls`, `status`, `mint`, `attenuate` and `inspect` (offline), `authorize`, `forward`, `stream`. Secrets and tokens never appear in argv.
+
+## 4. Tests
+
+`#tooth` tests drive the real broker over its real boundaries against local HTTP/SSE servers: the engine API, the Unix socket, the loopback gateway and the `keygate` binary. They include fault injection for journal writes, a run on a filesystem that is actually full (inside a `bwrap` sandbox with a 192 KiB tmpfs), and checks of `/proc` for the hardened process. HARDENING.md lists which test pins which audit finding.

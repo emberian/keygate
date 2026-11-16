@@ -1,18 +1,30 @@
 //! The Unix-socket transport: framed JSON, with the peer's uid taken from
 //! the kernel (`SO_PEERCRED` on Linux, `getpeereid` on macOS) for every
-//! connection. The uid gates operator requests and uid-bound macaroons.
+//! connection. The uid gates operator requests and uid-bound macaroons, and
+//! in a separated deployment a peer with the broker's own uid is not served
+//! as a caller.
+//!
+//! What a connection may make the broker buffer is bounded before any
+//! token has been seen: frames are limited to
+//! [`PREAUTH_FRAME_BYTES`](keygate_core::proto::PREAUTH_FRAME_BYTES) until
+//! the peer `present`s a token that verifies for a row, which raises the
+//! limit to that row's request size. Frame memory grows only as bytes
+//! arrive, a frame must complete within `request_read_timeout_ms`, and an
+//! idle connection is closed after `idle_timeout_ms`.
 
 use crate::engine::{Broker, Caller, HeaderMode, StreamItem, StreamOutcome};
-use crate::wire::{read_frame, write_frame};
+use crate::wire::{read_frame_body, read_frame_len, write_frame};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use keygate_core::journal::CallKind;
-use keygate_core::proto::{Code, Refusal, Request, Response, PROTOCOL_VERSION};
+use keygate_core::proto::{
+    Code, Refusal, Request, Response, MAX_FRAME_BYTES, PREAUTH_FRAME_BYTES, PROTOCOL_VERSION,
+};
 use keygate_core::secret::SecretBytes;
 use keygate_core::Namespace;
 use std::future::Future;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, BufReader};
@@ -22,6 +34,10 @@ use zeroize::Zeroize;
 
 /// Bind the broker socket with `mode`. A leftover socket file from a dead
 /// broker is replaced; a live one is an error.
+///
+/// The socket is bound under a private temporary name, given its mode, and
+/// only then renamed into place, so it is never reachable at its public
+/// path with any mode but the configured one.
 pub fn bind(path: &Path, mode: u32) -> io::Result<UnixListener> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
@@ -31,7 +47,6 @@ pub fn bind(path: &Path, mode: u32) -> io::Result<UnixListener> {
                     format!("a broker is already listening on {}", path.display()),
                 ));
             }
-            std::fs::remove_file(path)?;
         }
         Ok(_) => {
             return Err(io::Error::new(
@@ -42,8 +57,18 @@ pub fn bind(path: &Path, mode: u32) -> io::Result<UnixListener> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    let mut nonce = [0u8; 4];
+    keygate_core::random_bytes(&mut nonce)?;
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(format!(".{:08x}", u32::from_le_bytes(nonce)));
+    let staging = PathBuf::from(staging);
+    let listener = UnixListener::bind(&staging)?;
+    let installed = std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(mode))
+        .and_then(|()| std::fs::rename(&staging, path));
+    if let Err(e) = installed {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
     Ok(listener)
 }
 
@@ -73,36 +98,84 @@ pub async fn serve(broker: Broker, listener: UnixListener) -> io::Result<()> {
     }
 }
 
+/// The frame size a connection may send once a token has verified for a
+/// row accepting `max_body` bytes: the body in base64, plus room for the
+/// token, headers and the rest of the JSON.
+pub fn frame_limit_for(max_body: usize) -> usize {
+    (max_body.div_ceil(3) * 4 + PREAUTH_FRAME_BYTES).min(MAX_FRAME_BYTES)
+}
+
+/// Per-connection admission state.
+struct Conn {
+    uid: u32,
+    /// Largest frame this peer may currently send.
+    frame_limit: usize,
+    /// Bytes read ahead of the frame being handled (pipelining).
+    pending: zeroize::Zeroizing<Vec<u8>>,
+}
+
 async fn connection(broker: Broker, stream: UnixStream) -> io::Result<()> {
     let uid = stream.peer_cred()?.uid();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut pending = zeroize::Zeroizing::new(Vec::new());
+    let mut conn = Conn {
+        uid,
+        frame_limit: PREAUTH_FRAME_BYTES,
+        pending: zeroize::Zeroizing::new(Vec::new()),
+    };
+    let idle = Duration::from_millis(broker.config().idle_timeout_ms);
+    let deadline = Duration::from_millis(broker.config().request_read_timeout_ms);
     loop {
         let mut queued =
-            std::io::Cursor::new(zeroize::Zeroizing::new(std::mem::take(&mut *pending)));
-        let frame = read_frame(&mut (&mut queued).chain(&mut reader)).await?;
+            std::io::Cursor::new(zeroize::Zeroizing::new(std::mem::take(&mut *conn.pending)));
+        let frame = {
+            let mut input = (&mut queued).chain(&mut reader);
+            // Waiting for a request to start is bounded by the idle
+            // timeout; once its length has arrived, the whole frame is
+            // bounded by the read deadline.
+            let Ok(len) = tokio::time::timeout(idle, read_frame_len(&mut input)).await else {
+                break;
+            };
+            match len? {
+                None => None,
+                Some(len) if len > conn.frame_limit => {
+                    let refusal = Refusal::new(
+                        Code::TooLarge,
+                        format!(
+                            "frame of {len} bytes exceeds this connection's limit of {}; send \
+                             `present` with a token for the row first",
+                            conn.frame_limit
+                        ),
+                    );
+                    write_frame(&mut writer, &Response::Error(refusal)).await?;
+                    break;
+                }
+                Some(len) => {
+                    match tokio::time::timeout(deadline, read_frame_body(&mut input, len)).await {
+                        Ok(body) => Some(body?),
+                        Err(_) => {
+                            let refusal = Refusal::new(
+                                Code::Timeout,
+                                "the frame was not delivered within the read deadline",
+                            );
+                            write_frame(&mut writer, &Response::Error(refusal)).await?;
+                            break;
+                        }
+                    }
+                }
+            }
+        };
         let consumed = queued.position() as usize;
-        pending = queued.into_inner();
-        pending[..consumed].zeroize();
-        pending.drain(..consumed);
+        conn.pending = queued.into_inner();
+        conn.pending[..consumed].zeroize();
+        conn.pending.drain(..consumed);
         let Some(mut frame) = frame else {
             break;
         };
         let request = serde_json::from_slice::<Request>(&frame);
         frame.zeroize();
         let keep_open = match request {
-            Ok(request) => {
-                dispatch(
-                    &broker,
-                    uid,
-                    request,
-                    &mut reader,
-                    &mut pending,
-                    &mut writer,
-                )
-                .await?
-            }
+            Ok(request) => dispatch(&broker, &mut conn, request, &mut reader, &mut writer).await?,
             Err(e) => {
                 write_frame(
                     &mut writer,
@@ -125,14 +198,19 @@ async fn connection(broker: Broker, stream: UnixStream) -> io::Result<()> {
 /// Run `work` unless the peer hangs up first. Returning `None` drops the
 /// future, which is what turns an in-flight buffered call `Uncertain` and
 /// aborts its upstream request.
-async fn until_hangup<R, F>(reader: &mut R, pending: &mut Vec<u8>, work: F) -> Option<F::Output>
+async fn until_hangup<R, F>(
+    reader: &mut R,
+    pending: &mut Vec<u8>,
+    limit: usize,
+    work: F,
+) -> Option<F::Output>
 where
     R: AsyncBufRead + Unpin,
     F: Future,
 {
     tokio::select! {
         biased;
-        _ = watch_hangup(reader, pending) => None,
+        _ = watch_hangup(reader, pending, limit) => None,
         output = work => Some(output),
     }
 }
@@ -140,14 +218,17 @@ where
 /// Drain pipelined input into bounded read-ahead so buffered bytes cannot
 /// mask EOF. Excess pipelining closes the connection instead of growing
 /// memory indefinitely. All reads are readiness driven.
-async fn watch_hangup<R: AsyncBufRead + Unpin>(reader: &mut R, pending: &mut Vec<u8>) {
+async fn watch_hangup<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    pending: &mut Vec<u8>,
+    limit: usize,
+) {
     loop {
         let Ok(bytes) = reader.fill_buf().await else {
             return;
         };
-        if bytes.is_empty()
-            || pending.len() + bytes.len() > keygate_core::proto::MAX_FRAME_BYTES + 4
-        {
+        // Read-ahead is held to what one frame from this peer may be.
+        if bytes.is_empty() || pending.len() + bytes.len() > limit + 4 {
             return;
         }
         pending.extend_from_slice(bytes);
@@ -159,16 +240,18 @@ async fn watch_hangup<R: AsyncBufRead + Unpin>(reader: &mut R, pending: &mut Vec
 /// Handle one request. `Ok(false)` means the peer is gone.
 async fn dispatch<R, W>(
     broker: &Broker,
-    uid: u32,
+    conn: &mut Conn,
     request: Request,
     reader: &mut R,
-    pending: &mut Vec<u8>,
     writer: &mut W,
 ) -> io::Result<bool>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let uid = conn.uid;
+    let limit = conn.frame_limit;
+    let pending: &mut Vec<u8> = &mut conn.pending;
     let caller = Caller { uid: Some(uid) };
     let operator = || {
         if broker.is_operator(uid) {
@@ -190,6 +273,8 @@ where
                 uid,
                 operator: broker.is_operator(uid),
                 namespaces: broker.namespaces(),
+                deployment: broker.status_deployment().to_owned(),
+                caller: broker.may_call(Some(uid)),
             };
             write_frame(writer, &hello).await?;
             return Ok(true);
@@ -222,11 +307,28 @@ where
             .await?;
             return Ok(true);
         }
+        Request::Present {
+            token,
+            namespace,
+            row,
+        } => {
+            let presented = broker
+                .preauthorize(namespace, &row, &token, caller)
+                .map(|max| {
+                    conn.frame_limit = conn.frame_limit.max(frame_limit_for(max));
+                    Response::Presented {
+                        max_frame_bytes: conn.frame_limit,
+                    }
+                });
+            write_frame(writer, &answer(presented)).await?;
+            return Ok(true);
+        }
         Request::Set {
             namespace,
             row,
             mut secret_b64,
             cut_existing,
+            forget_retired,
         } => {
             let decoded = STANDARD.decode(secret_b64.as_bytes()).map(SecretBytes::new);
             secret_b64.zeroize();
@@ -237,17 +339,36 @@ where
                         let secret = decoded.map_err(|_| {
                             Refusal::new(Code::BadRequest, "secret_b64 is not base64")
                         })?;
-                        broker.set(namespace, &row, secret, cut_existing, caller)
+                        broker.set(
+                            namespace,
+                            &row,
+                            secret,
+                            cut_existing,
+                            forget_retired,
+                            caller,
+                        )
                     })
                 })
                 .await;
             write_frame(writer, &answer(done.map(|_| Response::Ok))).await?;
             return Ok(true);
         }
-        Request::Revoke { namespace, row } => {
+        Request::Revoke {
+            namespace,
+            row,
+            forget,
+        } => {
             let allowed = operator();
             let done = broker
-                .disk(move |b| allowed.and_then(|()| b.revoke(namespace, &row, caller)))
+                .disk(move |b| allowed.and_then(|()| b.revoke(namespace, &row, forget, caller)))
+                .await;
+            write_frame(writer, &answer(done.map(|_| Response::Ok))).await?;
+            return Ok(true);
+        }
+        Request::Forget { namespace, row } => {
+            let allowed = operator();
+            let done = broker
+                .disk(move |b| allowed.and_then(|()| b.forget(namespace, &row, caller)))
                 .await;
             write_frame(writer, &answer(done.map(|_| Response::Ok))).await?;
             return Ok(true);
@@ -280,7 +401,8 @@ where
             return Ok(true);
         }
         Request::ProviderAuthorize(call) => {
-            let kind = provider_authorize_kind(&call);
+            // Reserve for whichever operation the body asks for.
+            let kind = Broker::provider_kind(&call.body);
             (Namespace::Provider, call, kind, false)
         }
         Request::ServiceAuthorize(auth) => {
@@ -316,6 +438,7 @@ where
             let Some(result) = until_hangup(
                 reader,
                 pending,
+                limit,
                 broker.forward(ns, caller, call, HeaderMode::Strict),
             )
             .await
@@ -335,6 +458,7 @@ where
             let Some(result) = until_hangup(
                 reader,
                 pending,
+                limit,
                 broker.stream(ns, caller, call, HeaderMode::Strict),
             )
             .await
@@ -360,7 +484,7 @@ where
                     return Ok(true);
                 }
             };
-            let completed = until_hangup(reader, pending, async {
+            let completed = until_hangup(reader, pending, limit, async {
                 let ticket = live.ticket;
                 write_frame(
                     writer,
@@ -403,18 +527,4 @@ where
         }
     }
     Ok(true)
-}
-
-/// `provider-authorize` reserves for whichever operation the body asks
-/// for: a stream ticket when it says `"stream": true`, else a buffered one.
-fn provider_authorize_kind(call: &keygate_core::proto::Call) -> CallKind {
-    #[derive(serde::Deserialize)]
-    struct Probe {
-        #[serde(default)]
-        stream: bool,
-    }
-    match serde_json::from_slice::<Probe>(&call.body) {
-        Ok(Probe { stream: true }) => CallKind::Stream,
-        _ => CallKind::Buffered,
-    }
 }

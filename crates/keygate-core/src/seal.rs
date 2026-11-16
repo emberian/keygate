@@ -15,7 +15,12 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 const SEAL_LABEL: &[u8] = b"keygate-seal/v1";
-const MAGIC: &[u8; 4] = b"KGS1";
+/// Format 1: `generation | revoked_floor | has_secret | secret`.
+const MAGIC_V1: &[u8; 4] = b"KGS1";
+/// Format 2 adds length prefixes and the retired, guard-only secrets.
+const MAGIC: &[u8; 4] = b"KGS2";
+/// Retired secrets kept per row for the response guard.
+pub const MAX_RETIRED: usize = 8;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const MASTER_KEY_LEN: usize = 32;
@@ -67,7 +72,9 @@ impl MasterKey {
             });
         }
         let mut buf = Vec::with_capacity(MASTER_KEY_LEN + 1);
-        file.read_to_end(&mut buf)?;
+        (&mut file)
+            .take(MASTER_KEY_LEN as u64 + 1)
+            .read_to_end(&mut buf)?;
         let key = SecretBytes::new(buf);
         if key.len() != MASTER_KEY_LEN {
             return Err(SealError::BadMasterKey(path.to_owned()));
@@ -94,6 +101,16 @@ pub struct SealedRow {
     pub generation: u64,
     pub revoked_floor: u64,
     pub secret: Option<SecretBytes>,
+    /// Earlier secrets of this row. They are never sent anywhere; they are
+    /// kept (sealed like the active one) only so the response guard keeps
+    /// withholding them while they may still be valid upstream. The
+    /// operator drops them with `forget`.
+    pub retired: Vec<RetiredSecret>,
+}
+
+pub struct RetiredSecret {
+    pub generation: u64,
+    pub secret: SecretBytes,
 }
 
 fn aad(ns: Namespace, row: &str) -> Vec<u8> {
@@ -130,18 +147,32 @@ impl SealStore {
 
     pub fn seal(&self, ns: Namespace, row: &str, sealed: &SealedRow) -> Result<Vec<u8>, SealError> {
         check_row(row)?;
+        if sealed.retired.len() > MAX_RETIRED {
+            return Err(SealError::Malformed {
+                ns,
+                row: row.to_owned(),
+            });
+        }
         let secret = sealed
             .secret
             .as_ref()
             .map(SecretBytes::expose)
             .unwrap_or(&[]);
-        // Reserve the tag up front so appending it cannot reallocate and
-        // strand a plaintext copy in freed memory.
-        let mut buf = Vec::with_capacity(17 + secret.len() + TAG_LEN);
+        let retired_len: usize = sealed.retired.iter().map(|r| 12 + r.secret.len()).sum();
+        // Reserve everything, tag included, up front so nothing here can
+        // reallocate and strand a plaintext copy in freed memory.
+        let mut buf = Vec::with_capacity(25 + secret.len() + retired_len + TAG_LEN);
         buf.extend_from_slice(&sealed.generation.to_le_bytes());
         buf.extend_from_slice(&sealed.revoked_floor.to_le_bytes());
         buf.push(u8::from(sealed.secret.is_some()));
+        buf.extend_from_slice(&(secret.len() as u32).to_le_bytes());
         buf.extend_from_slice(secret);
+        buf.extend_from_slice(&(sealed.retired.len() as u32).to_le_bytes());
+        for retired in &sealed.retired {
+            buf.extend_from_slice(&retired.generation.to_le_bytes());
+            buf.extend_from_slice(&(retired.secret.len() as u32).to_le_bytes());
+            buf.extend_from_slice(retired.secret.expose());
+        }
 
         let mut nonce = [0u8; NONCE_LEN];
         crate::random_bytes(&mut nonce)?;
@@ -169,38 +200,83 @@ impl SealStore {
             ns,
             row: row.to_owned(),
         };
-        if blob.len() < MAGIC.len() + NONCE_LEN + 17 + TAG_LEN || &blob[..4] != MAGIC {
+        if blob.len() < MAGIC.len() + NONCE_LEN + 17 + TAG_LEN {
             return Err(malformed());
         }
+        let v1 = match &blob[..4] {
+            magic if magic == MAGIC => false,
+            magic if magic == MAGIC_V1 => true,
+            _ => return Err(malformed()),
+        };
         let nonce = Nonce::from_slice(&blob[4..4 + NONCE_LEN]);
-        let mut buf = blob[4 + NONCE_LEN..].to_vec();
+        let mut buf = zeroize::Zeroizing::new(blob[4 + NONCE_LEN..].to_vec());
         if self
             .cipher()
-            .decrypt_in_place(nonce, &aad(ns, row), &mut buf)
+            .decrypt_in_place(nonce, &aad(ns, row), &mut *buf)
             .is_err()
         {
-            buf.zeroize();
             return Err(SealError::Unauthentic {
                 ns,
                 row: row.to_owned(),
             });
         }
-        let generation = u64::from_le_bytes(buf[0..8].try_into().expect("length checked"));
-        let revoked_floor = u64::from_le_bytes(buf[8..16].try_into().expect("length checked"));
-        let secret = match buf[16] {
-            0 if buf.len() == 17 => None,
-            1 => Some(SecretBytes::new(buf[17..].to_vec())),
-            _ => {
-                buf.zeroize();
-                return Err(malformed());
+        struct Cursor<'a>(&'a [u8]);
+        impl<'a> Cursor<'a> {
+            fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+                if self.0.len() < n {
+                    return None;
+                }
+                let (head, tail) = self.0.split_at(n);
+                self.0 = tail;
+                Some(head)
             }
+            fn u64(&mut self) -> Option<u64> {
+                Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+            }
+            fn len(&mut self) -> Option<usize> {
+                Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?) as usize)
+            }
+        }
+        let mut cursor = Cursor(&buf);
+        let mut parse = || -> Option<SealedRow> {
+            let generation = cursor.u64()?;
+            let revoked_floor = cursor.u64()?;
+            let has_secret = match cursor.take(1)?[0] {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let mut retired = Vec::new();
+            let secret_bytes = if v1 {
+                cursor.take(cursor.0.len())?
+            } else {
+                let len = cursor.len()?;
+                let secret = cursor.take(len)?;
+                let count = cursor.len()?;
+                if count > MAX_RETIRED {
+                    return None;
+                }
+                for _ in 0..count {
+                    let generation = cursor.u64()?;
+                    let len = cursor.len()?;
+                    retired.push(RetiredSecret {
+                        generation,
+                        secret: SecretBytes::new(cursor.take(len)?.to_vec()),
+                    });
+                }
+                secret
+            };
+            if !cursor.0.is_empty() || (!has_secret && !secret_bytes.is_empty()) {
+                return None;
+            }
+            Some(SealedRow {
+                generation,
+                revoked_floor,
+                secret: has_secret.then(|| SecretBytes::new(secret_bytes.to_vec())),
+                retired,
+            })
         };
-        buf.zeroize();
-        Ok(SealedRow {
-            generation,
-            revoked_floor,
-            secret,
-        })
+        parse().ok_or_else(malformed)
     }
 
     /// Seal and durably replace the row file (tmp + fsync + rename + dir fsync).
@@ -217,7 +293,15 @@ impl SealStore {
         match open_read_nofollow(&self.path(ns, row)?) {
             Ok(mut file) => {
                 let mut blob = Vec::new();
-                file.read_to_end(&mut blob)?;
+                (&mut file)
+                    .take(MAX_SEALED_BYTES + 1)
+                    .read_to_end(&mut blob)?;
+                if blob.len() as u64 > MAX_SEALED_BYTES {
+                    return Err(SealError::Malformed {
+                        ns,
+                        row: row.to_owned(),
+                    });
+                }
                 self.open(ns, row, &blob).map(Some)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -234,12 +318,31 @@ fn check_row(row: &str) -> Result<(), SealError> {
     }
 }
 
+/// Open a custody file for reading: never through a symlink, never
+/// blocking on a FIFO planted at the path, and only if what was opened is a
+/// regular file. The checks are on the descriptor, not on the name.
 pub(crate) fn open_read_nofollow(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    require_regular(path, &file)?;
+    Ok(file)
 }
+
+pub(crate) fn require_regular(path: &Path, file: &File) -> io::Result<()> {
+    if file.metadata()?.is_file() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ))
+    }
+}
+
+/// Largest sealed row read: a full secret, eight retired ones, overhead.
+const MAX_SEALED_BYTES: u64 = 128 << 10;
 
 /// A privately owned temporary name in the destination's directory. Never
 /// unlink another writer's temporary file, including after a collision.
@@ -316,6 +419,7 @@ mod tests {
             generation: 3,
             revoked_floor: 1,
             secret: Some(SecretBytes::new(secret.to_vec())),
+            retired: Vec::new(),
         }
     }
 
@@ -340,6 +444,7 @@ mod tests {
                 generation: 3,
                 revoked_floor: 4,
                 secret: None,
+                retired: Vec::new(),
             },
         )
         .unwrap();
@@ -347,6 +452,85 @@ mod tests {
         assert!(back.secret.is_none());
         assert_eq!(back.revoked_floor, 4);
         assert!(s.read(Namespace::Service, "anthropic").unwrap().is_none());
+    }
+
+    /// Retired secrets ride in the same authenticated blob, and blobs
+    /// written by format 1 still open.
+    #[test]
+    fn retired_secrets_round_trip_and_format_1_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut sealed = row(b"current-secret-0003");
+        sealed.retired = vec![
+            RetiredSecret {
+                generation: 1,
+                secret: SecretBytes::new(b"retired-secret-0001".to_vec()),
+            },
+            RetiredSecret {
+                generation: 2,
+                secret: SecretBytes::new(b"retired-secret-0002".to_vec()),
+            },
+        ];
+        s.write(Namespace::Service, "api", &sealed).unwrap();
+        let back = s.read(Namespace::Service, "api").unwrap().unwrap();
+        assert_eq!(back.secret.unwrap().expose(), b"current-secret-0003");
+        let retired: Vec<(u64, &[u8])> = back
+            .retired
+            .iter()
+            .map(|r| (r.generation, r.secret.expose()))
+            .collect();
+        assert_eq!(
+            retired,
+            vec![
+                (1, b"retired-secret-0001".as_slice()),
+                (2, b"retired-secret-0002")
+            ]
+        );
+        let on_disk = fs::read(s.path(Namespace::Service, "api").unwrap()).unwrap();
+        assert!(
+            !on_disk.windows(7).any(|w| w == b"retired"),
+            "retired secrets are sealed too"
+        );
+
+        // A revoked row keeps its retired secrets and no active one.
+        sealed.secret = None;
+        let blob = s.seal(Namespace::Service, "api", &sealed).unwrap();
+        let back = s.open(Namespace::Service, "api", &blob).unwrap();
+        assert!(back.secret.is_none());
+        assert_eq!(back.retired.len(), 2);
+
+        // More than the cap is refused at seal time.
+        sealed.retired = (0..=MAX_RETIRED as u64)
+            .map(|g| RetiredSecret {
+                generation: g,
+                secret: SecretBytes::new(b"retired-secret-xxxx".to_vec()),
+            })
+            .collect();
+        assert!(s.seal(Namespace::Service, "api", &sealed).is_err());
+
+        // Format 1, as written before retired secrets existed.
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&7u64.to_le_bytes());
+        plain.extend_from_slice(&2u64.to_le_bytes());
+        plain.push(1);
+        plain.extend_from_slice(b"format-one-secret");
+        let nonce = [5u8; NONCE_LEN];
+        s.cipher()
+            .encrypt_in_place(
+                Nonce::from_slice(&nonce),
+                &aad(Namespace::Provider, "old"),
+                &mut plain,
+            )
+            .unwrap();
+        let v1 = [MAGIC_V1.as_slice(), &nonce, &plain].concat();
+        let back = s.open(Namespace::Provider, "old", &v1).unwrap();
+        assert_eq!((back.generation, back.revoked_floor), (7, 2));
+        assert_eq!(back.secret.unwrap().expose(), b"format-one-secret");
+        assert!(back.retired.is_empty());
+        // Truncated or padded plaintext is malformed, not silently accepted.
+        let mut cut = blob.clone();
+        cut.truncate(cut.len() - 1);
+        assert!(s.open(Namespace::Service, "api", &cut).is_err());
     }
 
     /// #tooth: a sealed blob is bound to its namespace and row by the AAD.

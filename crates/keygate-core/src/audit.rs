@@ -63,7 +63,13 @@ struct Line<'a> {
 }
 
 pub struct AuditLog {
-    file: Mutex<File>,
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    file: File,
+    /// File length after the last complete line this process wrote.
+    good_len: Option<u64>,
 }
 
 impl AuditLog {
@@ -74,8 +80,9 @@ impl AuditLog {
             .append(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
+        crate::seal::require_regular(path, &file)?;
         let mode = file.metadata()?.mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(io::Error::new(
@@ -91,24 +98,34 @@ impl AuditLog {
 
     /// Adopt an already-open descriptor (must be in append mode).
     pub fn from_file(file: File) -> Self {
+        let good_len = file.metadata().ok().map(|m| m.len());
         AuditLog {
-            file: Mutex::new(file),
+            inner: Mutex::new(Inner { file, good_len }),
         }
     }
 
-    /// Append one event and force it to stable storage.
+    /// Append one event and force it to stable storage. A clock that cannot
+    /// be read is an error here too: an audit line needs its time.
     pub fn append(&self, event: &AuditEvent<'_>) -> io::Result<()> {
-        let mut line = serde_json::to_vec(&Line {
-            ts_unix_ms: crate::now_unix_ms(),
-            event,
-        })?;
+        let ts_unix_ms = crate::unix_time_ms().map_err(io::Error::other)?;
+        let mut line = serde_json::to_vec(&Line { ts_unix_ms, event })?;
         line.push(b'\n');
-        let mut file = self
-            .file
+        let mut inner = self
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        file.write_all(&line)?;
-        file.sync_data()
+        if let Err(e) = inner.file.write_all(&line) {
+            // Do not leave half a line for the next event to be glued to.
+            if let Some(len) = inner.good_len {
+                let _ = inner.file.set_len(len);
+            }
+            return Err(e);
+        }
+        inner.file.sync_data()?;
+        if let Some(len) = &mut inner.good_len {
+            *len += line.len() as u64;
+        }
+        Ok(())
     }
 }
 

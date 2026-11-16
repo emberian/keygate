@@ -242,12 +242,13 @@ pub fn config(origin: &str) -> String {
     format!(
         r#"
 [broker]
+deployment = "development"
 retention_s = 600
 
 [providers.llm]
 origin = "{origin}"
 auth_header = "x-api-key"
-paths = ["/v1/messages"]
+dialect = "anthropic-messages"
 models = ["m-small", "m-large"]
 max_output_tokens = 1000
 output_micro_usd_per_mtok = 1000000
@@ -262,6 +263,23 @@ stream_paths = ["/events"]
 caller_headers = ["last-event-id", "x-trace"]
 "#
     )
+}
+
+/// These tests run as one uid against plain-HTTP loopback upstreams, which
+/// is exactly what a development deployment is. Tests of the separated
+/// deployment say so in their own config.
+pub fn development(config: &str) -> String {
+    if config.contains("deployment") {
+        config.to_owned()
+    } else if config.contains("[broker]") {
+        config.replacen("[broker]", "[broker]\ndeployment = \"development\"", 1)
+    } else {
+        format!("[broker]\ndeployment = \"development\"\n{config}")
+    }
+}
+
+pub fn now_unix_s() -> u64 {
+    keygate_core::unix_time().expect("test host clock")
 }
 
 pub struct Rig {
@@ -282,18 +300,18 @@ impl Rig {
 
     /// Same, with no secrets loaded.
     pub fn unset(config: &str) -> Self {
+        Rig::unset_with(config, BrokerOptions::default())
+    }
+
+    pub fn unset_with(config: &str, options: BrokerOptions) -> Self {
+        let config = development(config);
         let dir = tempfile::tempdir().unwrap();
         Broker::init_state(dir.path()).unwrap();
-        let broker = Broker::open(
-            dir.path(),
-            Config::parse(config).unwrap(),
-            BrokerOptions::default(),
-        )
-        .unwrap();
+        let broker = Broker::open(dir.path(), Config::parse(&config).unwrap(), options).unwrap();
         Rig {
             dir,
             broker,
-            config: config.to_owned(),
+            config,
         }
     }
 
@@ -324,6 +342,7 @@ impl Rig {
                 row,
                 SecretBytes::new(secret.as_bytes().to_vec()),
                 cut_existing,
+                false,
                 OPERATOR,
             )
             .unwrap();

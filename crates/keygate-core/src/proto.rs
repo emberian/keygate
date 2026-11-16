@@ -9,9 +9,13 @@ use crate::macaroon::Caveat;
 use crate::Namespace;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
-/// Largest frame either side will read.
+pub const PROTOCOL_VERSION: u32 = 2;
+/// Largest frame either side will ever read.
 pub const MAX_FRAME_BYTES: usize = 48 << 20;
+/// Largest frame the broker reads from a connection that has not yet
+/// presented a valid token for a larger one (see [`Request::Present`]).
+/// Every operator request and every token fits well inside it.
+pub const PREAUTH_FRAME_BYTES: usize = 64 << 10;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
@@ -45,15 +49,36 @@ pub enum Request {
         secret_b64: String,
         #[serde(default)]
         cut_existing: bool,
+        /// Drop the row's retired secrets in the same step (for rotation
+        /// scripts that have already invalidated the old key upstream).
+        #[serde(default)]
+        forget_retired: bool,
     },
-    /// Operator: destroy a row's secret and cut every stream using it.
+    /// Operator: stop using a row's secret and cut every stream on it. The
+    /// secret is kept sealed as a retired, guard-only pattern unless
+    /// `forget` is set.
     Revoke {
         namespace: Namespace,
         row: String,
+        #[serde(default)]
+        forget: bool,
     },
     /// Operator: invalidate every macaroon minted for a seat so far.
     RevokeSeat {
         seat: String,
+    },
+    /// Operator: drop a row's retired, guard-only secrets.
+    Forget {
+        namespace: Namespace,
+        row: String,
+    },
+    /// Caller: prove a token before sending a request larger than
+    /// [`PREAUTH_FRAME_BYTES`]. The broker verifies it against the row and
+    /// answers with the frame size this connection may now send.
+    Present {
+        token: String,
+        namespace: Namespace,
+        row: String,
     },
     Ls,
     Status,
@@ -104,6 +129,9 @@ pub struct RowInfo {
     pub state: String,
     pub generation: u64,
     pub revoked_floor: u64,
+    /// Earlier secrets still withheld from responses (see `forget`).
+    #[serde(default)]
+    pub retired: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +141,15 @@ pub struct StatusInfo {
     pub provider_rows: Option<usize>,
     pub service_rows: Option<usize>,
     pub guarded_secrets: usize,
+    /// Bytes of guard patterns in use, out of `echo::MAX_GUARD_BYTES`.
+    #[serde(default)]
+    pub guard_pattern_bytes: usize,
+    /// `separated` or `development`.
+    #[serde(default)]
+    pub deployment: String,
+    /// Calls currently between `Begin` and their recorded outcome.
+    #[serde(default)]
+    pub in_flight: usize,
     pub journal: JournalStats,
     pub http_listen: Option<String>,
 }
@@ -127,9 +164,20 @@ pub enum Response {
         uid: u32,
         operator: bool,
         namespaces: Vec<Namespace>,
+        /// `separated` or `development`.
+        #[serde(default)]
+        deployment: String,
+        /// Whether this peer may make calls. False for a peer that shares
+        /// the broker's uid in a separated deployment.
+        #[serde(default)]
+        caller: bool,
     },
     Token {
         token: String,
+    },
+    /// Answer to `present`: frames up to this size are now accepted.
+    Presented {
+        max_frame_bytes: usize,
     },
     Authorized {
         ticket: TicketId,
@@ -213,6 +261,12 @@ pub enum Code {
     AuditFailed,
     JournalFailed,
     UpstreamFailed,
+    /// The request was not delivered within the read deadline.
+    Timeout,
+    /// The broker is shutting down and takes no new calls.
+    ShuttingDown,
+    /// The system clock is unusable, so expiries cannot be evaluated.
+    ClockFailed,
     Internal,
 }
 
@@ -221,6 +275,8 @@ impl Code {
     pub const fn http_status(self) -> u16 {
         match self {
             Code::BadRequest | Code::PathRefused | Code::HeaderRefused => 400,
+            Code::Timeout => 408,
+            Code::ShuttingDown | Code::ClockFailed => 503,
             Code::BadToken => 401,
             Code::Denied
             | Code::NotOperator
@@ -314,6 +370,20 @@ mod tests {
             .unwrap();
         assert_eq!(err["type"], "error");
         assert_eq!(err["code"], "budget_exceeded");
+
+        // Fields added in protocol 2 default when an older peer omits them.
+        let revoke: Request =
+            serde_json::from_str(r#"{"op":"revoke","namespace":"service","row":"gh"}"#).unwrap();
+        assert!(matches!(revoke, Request::Revoke { forget: false, .. }));
+        let present = serde_json::to_value(Request::Present {
+            token: "kgm_x".into(),
+            namespace: Namespace::Provider,
+            row: "llm".into(),
+        })
+        .unwrap();
+        assert_eq!(present["op"], "present");
+        assert_eq!(Code::Timeout.http_status(), 408);
+        const _: () = assert!(PREAUTH_FRAME_BYTES < MAX_FRAME_BYTES);
         assert_eq!(
             Refusal::new(Code::Withheld, "cut").to_string(),
             "withheld: cut"

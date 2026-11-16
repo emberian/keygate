@@ -8,6 +8,8 @@
 pub mod client;
 pub mod engine;
 pub mod gateway;
+pub mod harden;
+mod provider;
 pub mod unix;
 pub mod vault;
 pub mod wire;
