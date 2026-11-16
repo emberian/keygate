@@ -204,19 +204,36 @@ fn content_part(dialect: Dialect, part: &Map<String, Value>, found: &mut Vec<Fea
         (Dialect::OpenaiChat | Dialect::OpenaiResponses, "input_audio") => {
             found.push((Allowance::InlineMedia, "inline audio"))
         }
-        (Dialect::OpenaiResponses, "input_image" | "input_file") => {
+        (Dialect::OpenaiResponses, "input_image" | "input_file" | "computer_screenshot") => {
+            let mut classified = false;
             if has("file_id") {
                 found.push((Allowance::ServerState, "a file_id"));
+                classified = true;
             }
-            match text("image_url").or(text("file_url")) {
+            let url = text("image_url")
+                .or_else(|| {
+                    part.get("image_url")
+                        .and_then(|u| u.get("url"))
+                        .and_then(Value::as_str)
+                })
+                .or(text("file_url"));
+            match url {
                 Some(url) if is_remote(url) => {
-                    found.push((Allowance::RemoteInput, "a remote image/file URL"))
+                    found.push((Allowance::RemoteInput, "a remote image/file URL"));
+                    classified = true;
                 }
-                Some(_) => found.push((Allowance::InlineMedia, "an inline image")),
+                Some(_) => {
+                    found.push((Allowance::InlineMedia, "an inline image"));
+                    classified = true;
+                }
                 None => {}
             }
             if has("file_data") {
                 found.push((Allowance::InlineMedia, "an inline file"));
+                classified = true;
+            }
+            if !classified {
+                found.push((Allowance::InlineMedia, "inline media"));
             }
         }
         (Dialect::OpenaiResponses, "item_reference") => {
@@ -272,6 +289,59 @@ fn server_tools(dialect: Dialect, top: &Map<String, Value>, found: &mut Vec<Feat
     }
     if dialect == Dialect::OpenaiChat && nonempty("web_search_options") {
         found.push((Allowance::ServerTools, "web_search_options"));
+    }
+}
+
+/// Classify direct items of an OpenAI Responses `input` union. In OpenAI's
+/// `ItemReference` schema, `type` is optional/nullable and defaults to
+/// `"item_reference"`, whereas untyped `EasyInputMessage` items carry `role`
+/// and `content` without `id`. Inspecting only the `input` union boundary
+/// avoids false positives on `id` fields inside tool schemas or arguments.
+fn responses_input_items(
+    top: &Map<String, Value>,
+    found: &mut Vec<Feature>,
+) -> Result<(), Refusal> {
+    match present(top, "input") {
+        None | Some(Value::String(_)) => Ok(()),
+        Some(Value::Array(items)) => {
+            for item in items {
+                let Some(item) = item.as_object() else {
+                    return Err(Refusal::new(
+                        Code::BadRequest,
+                        "OpenAI Responses \"input\" array items must be JSON objects",
+                    ));
+                };
+                match present(item, "type") {
+                    None => {
+                        if present(item, "id").is_some() {
+                            found.push((Allowance::ServerState, "an item_reference"));
+                        }
+                    }
+                    Some(Value::String(kind)) => {
+                        if kind == "message"
+                            && present(item, "id").is_some()
+                            && present(item, "content").is_none()
+                        {
+                            found.push((
+                                Allowance::ServerState,
+                                "a message reference without inline content",
+                            ));
+                        }
+                    }
+                    Some(_) => {
+                        return Err(Refusal::new(
+                            Code::BadRequest,
+                            "OpenAI Responses input item \"type\" must be a string",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some(_) => Err(Refusal::new(
+            Code::BadRequest,
+            "OpenAI Responses \"input\" must be a string or an array",
+        )),
     }
 }
 
@@ -401,6 +471,9 @@ fn inspect(row: &ProviderRow, top: &Map<String, Value>) -> Result<Inspected, Ref
     }
 
     let mut found = Vec::new();
+    if dialect == Dialect::OpenaiResponses {
+        responses_input_items(top, &mut found)?;
+    }
     top_level_features(dialect, top, &mut found);
     server_tools(dialect, top, &mut found);
     for value in top.values() {
@@ -580,6 +653,9 @@ pub(crate) struct UsageSniffer {
     data: zeroize::Zeroizing<Vec<u8>>,
     after_cr: bool,
     invalid: bool,
+    responses_seen: bool,
+    responses_terminal_seen: bool,
+    message_start_seen: bool,
     input: Option<u64>,
     cache_write: u64,
     cache_read: u64,
@@ -636,23 +712,55 @@ impl UsageSniffer {
             self.invalid = true;
             return;
         };
-        let kind = event.get("type").and_then(|v| v.as_str());
-        if kind == Some("error") || event.get("error").is_some() {
+        if self.responses_terminal_seen {
             self.invalid = true;
             return;
         }
+        let kind = event.get("type").and_then(|v| v.as_str());
+        if kind.is_some_and(|k| k.starts_with("response.")) {
+            self.responses_seen = true;
+        }
+        if kind == Some("message_start") {
+            if self.message_start_seen {
+                self.invalid = true;
+                return;
+            }
+            self.message_start_seen = true;
+        }
+        if matches!(
+            kind,
+            Some("error" | "response.failed" | "response.cancelled")
+        ) || event.get("error").is_some_and(|v| !v.is_null())
+        {
+            self.invalid = true;
+            return;
+        }
+        let terminal_response = matches!(kind, Some("response.completed" | "response.incomplete"));
+        if terminal_response {
+            self.responses_terminal_seen = true;
+        }
         let usage = match kind {
             Some("message_start") => event.get("message").and_then(|v| v.get("usage")),
-            Some("response.completed") => event.get("response").and_then(|v| v.get("usage")),
+            Some("response.completed" | "response.incomplete") => {
+                event.get("response").and_then(|v| v.get("usage"))
+            }
+            Some(k) if k.starts_with("response.") => return,
             _ => event.get("usage"),
         };
         let Some(usage) = usage.filter(|v| !v.is_null()) else {
+            if terminal_response {
+                self.invalid = true;
+            }
             return;
         };
         let Ok(usage) = serde_json::from_value::<Usage>(usage.clone()) else {
             self.invalid = true;
             return;
         };
+        if terminal_response && (usage.input_tokens.is_none() || usage.output_tokens.is_none()) {
+            self.invalid = true;
+            return;
+        }
         if let Some(input) = usage.input_tokens {
             self.input = Some(self.input.unwrap_or(0).max(input));
         }
@@ -667,7 +775,11 @@ impl UsageSniffer {
     }
 
     pub(crate) fn cost(self, prices: Prices) -> Option<u64> {
-        if self.invalid || !self.line.is_empty() || !self.data.is_empty() {
+        if self.invalid
+            || !self.line.is_empty()
+            || !self.data.is_empty()
+            || (self.responses_seen && !self.responses_terminal_seen)
+        {
             return None;
         }
         Some(micro_usd(&[
@@ -793,5 +905,28 @@ mod tests {
         assert!(sniff.line.is_empty() && sniff.data.is_empty());
         sniff.push(event);
         assert_eq!(sniff.cost(flat(1, 1)), None);
+
+        // K-A2: terminal `response.incomplete` with complete usage settles,
+        // while missing/partial usage, `response.failed`, or non-terminal
+        // `response.in_progress` alone preserves the reservation.
+        let mut incomplete = UsageSniffer::default();
+        incomplete.push(
+            b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\nevent: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"error\":null,\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":100,\"total_tokens\":103}}}\n\n",
+        );
+        assert_eq!(incomplete.cost(flat(1_000_000, 1_000_000)), Some(103));
+
+        for unuseable in [
+            b"data: {\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n".as_slice(),
+            b"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"usage\":null}}\n\n",
+            b"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":3}}}\n\n",
+            b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n\n",
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        ] {
+            let mut s = UsageSniffer::default();
+            s.push(unuseable);
+            assert_eq!(s.cost(flat(1_000_000, 1_000_000)), None);
+        }
     }
 }

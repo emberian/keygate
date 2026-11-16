@@ -44,7 +44,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -483,6 +483,16 @@ fn open_append(path: &Path) -> io::Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     crate::seal::require_regular(path, &file)?;
+    let mode = file.metadata()?.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{}: mode {mode:o} is accessible to group/other; expected 0600",
+                path.display()
+            ),
+        ));
+    }
     Ok(file)
 }
 
@@ -524,9 +534,9 @@ impl Journal {
                         good_len += n as u64;
                         appended += 1;
                     }
-                    // Unterminated or unparsable tail: a torn append.
-                    _ if reader.fill_buf()?.is_empty() => break,
-                    Ok(_) => unreachable!("an unterminated line is always the last"),
+                    // Unterminated final record: a crash mid-append.
+                    _ if !complete => break,
+                    Ok(_) => unreachable!("complete line matched above"),
                     Err(e) => {
                         return Err(JournalError::Corrupt {
                             line: line_no,
@@ -834,12 +844,16 @@ impl Inner {
         self.state.apply(rec);
         self.appended += 1;
         if self.appended >= self.compact_every {
-            // The record above is already durable; a failed compaction only
-            // postpones the rewrite (or poisons, if it failed after install).
+            // The record above is already durable; a failed compaction before
+            // install only postpones the rewrite, whereas a directory-sync
+            // failure after install poisons and must fail closed at once.
             let compacted = crate::unix_time()
                 .map_err(io::Error::other)
                 .and_then(|now| self.compact(now));
             if let Err(e) = compacted {
+                if self.poisoned.is_some() {
+                    return Err(e);
+                }
                 eprintln!("keygate: journal compaction failed (will retry): {e}");
                 self.appended = 0;
             }
@@ -1088,6 +1102,18 @@ mod tests {
             Journal::open(&path, 1000, 60),
             Err(JournalError::Corrupt { line: 1, .. })
         ));
+
+        // A newline-terminated malformed final record is corruption (not a
+        // crash-torn append) and must fail closed instead of silently
+        // reverting a committed InFlight transition back to Live.
+        let mut eof_corrupt = intact.clone();
+        eof_corrupt.extend_from_slice(b"corrupt\n");
+        fs::write(&path, &eof_corrupt).unwrap();
+        assert!(matches!(
+            Journal::open(&path, 1000, 60),
+            Err(JournalError::Corrupt { line: 2, .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), eof_corrupt);
     }
 
     #[test]
@@ -1183,14 +1209,15 @@ mod tests {
 
     #[test]
     fn journal_file_is_0600() {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
         let j = journal(dir.path());
         j.compact(NOW).unwrap();
-        assert_eq!(
-            fs::metadata(dir.path().join("journal.wal")).unwrap().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        drop(j);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(Journal::open(&path, 1000, 60).is_err());
     }
 
     /// #tooth: a different digest can reclaim expired Live budget without

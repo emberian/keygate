@@ -319,7 +319,10 @@ impl Rig {
         self.dir.path()
     }
 
-    /// Stop the broker and start a new one on the same state dir.
+    /// Stop the broker and start a new one on the same state dir. Background
+    /// `FlightGuard` drop tasks from an abandoned call may still be finishing
+    /// their final `audit.log` `fdatasync` on a blocking thread for a moment
+    /// after `drop(broker)`, during which `StateLock` rightly refuses reopen.
     pub fn reopen(self, options: BrokerOptions) -> Self {
         let Rig {
             dir,
@@ -327,6 +330,12 @@ impl Rig {
             config,
         } = self;
         drop(broker);
+        let deadline = std::time::Instant::now() + WAIT;
+        while keygate_broker::harden::state_is_locked(dir.path())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let broker = Broker::open(dir.path(), Config::parse(&config).unwrap(), options).unwrap();
         Rig {
             dir,

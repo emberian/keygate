@@ -53,7 +53,13 @@ impl Listeners {
         let socket_path = broker.state_dir().join(&cfg.socket);
         let unix = unix::bind(&socket_path, cfg.socket_mode)?;
         let http = match cfg.http_listen {
-            Some(addr) => Some(gateway::bind(addr).await?),
+            Some(addr) => match gateway::bind(addr).await {
+                Ok(listener) => Some(listener),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&socket_path);
+                    return Err(e);
+                }
+            },
             None => None,
         };
         let http_addr = http.as_ref().map(|l| l.local_addr()).transpose()?;

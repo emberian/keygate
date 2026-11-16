@@ -95,16 +95,14 @@ pub async fn write_raw_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8])
     writer.flush().await
 }
 
-/// Write one frame. The serialized bytes are zeroed afterwards because
-/// frames can carry tokens and secrets.
+/// Write one frame. The serialized bytes are zeroed afterwards (including if
+/// the write future is cancelled) because frames can carry tokens and secrets.
 pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     message: &T,
 ) -> io::Result<()> {
-    let mut body = serde_json::to_vec(message)?;
-    let result = write_raw_frame(writer, &body).await;
-    body.zeroize();
-    result
+    let body = zeroize::Zeroizing::new(serde_json::to_vec(message)?);
+    write_raw_frame(writer, &body).await
 }
 
 #[cfg(test)]

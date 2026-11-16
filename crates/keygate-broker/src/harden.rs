@@ -150,6 +150,116 @@ pub fn check_state_dir(dir: &Path, broker_uid: u32) -> io::Result<PathBuf> {
     Ok(canonical)
 }
 
+pub const STATE_LOCK_FILE: &str = "broker.lock";
+
+/// Exclusive ownership of a state directory across all `Broker` clones. The
+/// lockfile is a stable inode that is never renamed or unlinked (locking the
+/// replaceable WAL inode would fail to exclude a competing compaction). Keep
+/// this descriptor open until every mutable state handle has been dropped.
+pub(crate) struct StateLock {
+    _file: File,
+}
+
+impl StateLock {
+    pub(crate) fn acquire(state: &Path, broker_uid: u32) -> io::Result<Self> {
+        let path = state.join(STATE_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.uid() != broker_uid
+            || meta.mode() & 0o077 != 0
+            || meta.nlink() != 1
+        {
+            return Err(refuse(
+                &path,
+                "state lock must be a private, singly linked regular file owned by the broker"
+                    .into(),
+            ));
+        }
+        loop {
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "{}: state directory is already owned by a running broker",
+                            state.display()
+                        ),
+                    ));
+                }
+                Err(e) => return Err(io::Error::from(e)),
+            }
+        }
+        Ok(StateLock { _file: file })
+    }
+}
+
+/// Whether another live `Broker` handle currently holds `<state>/broker.lock`.
+#[doc(hidden)]
+pub fn state_is_locked(state: &Path) -> bool {
+    matches!(
+        StateLock::acquire(state, effective_uid()),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock
+    )
+}
+
+/// Read an optional private custody file inside an already-checked state
+/// directory (`seats.json`): no symlink traversal, nonblocking, regular file,
+/// `0600` owned by the broker, and bounded in size.
+pub(crate) fn read_state_file(
+    path: &Path,
+    broker_uid: u32,
+    max_bytes: u64,
+) -> io::Result<Option<Vec<u8>>> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(refuse(path, "state file is not a regular file".into()));
+    }
+    if meta.uid() != broker_uid {
+        return Err(refuse(
+            path,
+            format!(
+                "state file belongs to uid {}, expected broker uid {broker_uid}",
+                meta.uid()
+            ),
+        ));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(refuse(
+            path,
+            format!("state file has mode {mode:o}; expected 0600"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(refuse(
+            path,
+            format!("state file exceeds {max_bytes}-byte limit"),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
 /// Largest config file read.
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
 
@@ -354,5 +464,37 @@ mod tests {
         let err = read_config(&path, uid).unwrap_err();
         assert!(err.to_string().contains("not a regular file"), "{err}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// #tooth (K-A3): `StateLock` excludes a second opener until dropped and
+    /// refuses symlinks, loose modes and additional hard links.
+    #[test]
+    fn tooth_state_lock_is_exclusive_and_validates_custody() {
+        let uid = effective_uid();
+        let dir = tempfile::tempdir().unwrap();
+        chmod(dir.path(), 0o700);
+        let first = StateLock::acquire(dir.path(), uid).unwrap();
+        let err = StateLock::acquire(dir.path(), uid).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(first);
+        let second = StateLock::acquire(dir.path(), uid).unwrap();
+        drop(second);
+
+        let lock_path = dir.path().join(STATE_LOCK_FILE);
+        chmod(&lock_path, 0o640);
+        assert!(StateLock::acquire(dir.path(), uid).is_err());
+        chmod(&lock_path, 0o600);
+
+        let hard = dir.path().join("extra.link");
+        std::fs::hard_link(&lock_path, &hard).unwrap();
+        assert!(StateLock::acquire(dir.path(), uid).is_err());
+        std::fs::remove_file(&hard).unwrap();
+        std::fs::remove_file(&lock_path).unwrap();
+
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        chmod(&target, 0o600);
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+        assert!(StateLock::acquire(dir.path(), uid).is_err());
     }
 }

@@ -172,8 +172,11 @@ impl SealStore {
             .unwrap_or(&[]);
         let retired_len: usize = sealed.retired.iter().map(|r| 12 + r.secret.len()).sum();
         // Reserve everything, tag included, up front so nothing here can
-        // reallocate and strand a plaintext copy in freed memory.
-        let mut buf = Vec::with_capacity(25 + secret.len() + retired_len + TAG_LEN);
+        // reallocate and strand a plaintext copy in freed memory. `Zeroizing`
+        // also wipes the buffer if RNG or AEAD fails before encryption.
+        let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(
+            25 + secret.len() + retired_len + TAG_LEN,
+        ));
         buf.extend_from_slice(&sealed.generation.to_le_bytes());
         buf.extend_from_slice(&sealed.revoked_floor.to_le_bytes());
         buf.push(u8::from(sealed.secret.is_some()));
@@ -190,10 +193,9 @@ impl SealStore {
         crate::random_bytes(&mut nonce)?;
         if self
             .cipher()
-            .encrypt_in_place(Nonce::from_slice(&nonce), &aad(ns, row), &mut buf)
+            .encrypt_in_place(Nonce::from_slice(&nonce), &aad(ns, row), &mut *buf)
             .is_err()
         {
-            buf.zeroize();
             return Err(SealError::Malformed {
                 ns,
                 row: row.to_owned(),
@@ -293,10 +295,35 @@ impl SealStore {
 
     /// Seal and durably replace the row file (tmp + fsync + rename + dir fsync).
     pub fn write(&self, ns: Namespace, row: &str, sealed: &SealedRow) -> Result<(), SealError> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let blob = self.seal(ns, row, sealed)?;
         let path = self.path(ns, row)?;
         let dir = path.parent().expect("row path has a parent");
-        fs::create_dir_all(dir)?;
+        if let Ok(meta) = fs::symlink_metadata(dir) {
+            if !meta.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: namespace path is not a real directory", dir.display()),
+                )
+                .into());
+            }
+        }
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        if !fs::symlink_metadata(dir)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: namespace path is not a real directory", dir.display()),
+            )
+            .into());
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        // The namespace directory's entry lives in the state root. Sync the
+        // parent even when `dir` already existed in cache: an earlier creator
+        // may have crashed after `mkdir` before persisting its directory entry.
+        sync_parent(dir)?;
         write_atomic(&path, &blob)?;
         Ok(())
     }
@@ -412,9 +439,120 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 pub fn sync_parent(path: &Path) -> io::Result<()> {
-    match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => File::open(dir)?.sync_all(),
-        _ => Ok(()),
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    #[cfg(test)]
+    durability_probe::before(dir)?;
+    let result = File::open(dir)?.sync_all();
+    #[cfg(test)]
+    if result.is_ok() {
+        durability_probe::record(dir);
+    }
+    result
+}
+
+/// Create `dir` (and any missing intermediate directories) with mode `0700`,
+/// refusing a non-directory leaf, and `fsync` every parent directory in which
+/// a new entry was created up to and including the deepest pre-existing
+/// ancestor. If `dir` already existed, its parent directory is still synced.
+pub fn create_dir_all_0700_synced(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let full = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    if let Ok(meta) = fs::symlink_metadata(&full) {
+        if !meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{}: the state directory is not a directory (symlinks are not followed)",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    let mut missing = Vec::new();
+    let mut cursor: &Path = &full;
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(_) => {
+                if !fs::metadata(cursor)?.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("{}: ancestor is not a directory", cursor.display()),
+                    ));
+                }
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                let Some(parent) = cursor.parent() else {
+                    break;
+                };
+                cursor = parent;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&full)?;
+    if !fs::symlink_metadata(&full)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{}: the state directory is not a directory", dir.display()),
+        ));
+    }
+    // The directory may have existed already, with a wider mode.
+    fs::set_permissions(&full, fs::Permissions::from_mode(0o700))?;
+    if missing.is_empty() {
+        sync_parent(&fs::canonicalize(&full)?)?;
+    } else {
+        for created in missing.iter().rev() {
+            sync_parent(&fs::canonicalize(created)?)?;
+        }
+    }
+    Ok(())
+}
+
+/// Thread-local fault and ordering observer at the directory-fsync boundary.
+#[cfg(test)]
+pub(crate) mod durability_probe {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SYNCS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static FAIL: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub fn fail_dir(dir: Option<PathBuf>) {
+        FAIL.with(|slot| *slot.borrow_mut() = dir);
+    }
+
+    pub fn take() -> Vec<PathBuf> {
+        SYNCS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+    }
+
+    pub fn before(dir: &Path) -> io::Result<()> {
+        if FAIL.with(|slot| slot.borrow().as_deref() == Some(dir)) {
+            Err(io::Error::other("injected parent directory sync failure"))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn record(dir: &Path) {
+        SYNCS.with(|slot| slot.borrow_mut().push(dir.to_owned()));
     }
 }
 
@@ -694,5 +832,67 @@ mod tests {
         assert!(data.iter().all(|b| *b == data[0]));
         assert_eq!(fs::read(&fixed).unwrap(), b"owned by someone else");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    /// #tooth (K-A6): writing into a newly created namespace directory syncs
+    /// the state root (for `providers/` or `services/`) as well as the
+    /// namespace directory itself, refuses namespace symlinks, and fails
+    /// closed when either directory sync fails.
+    #[test]
+    fn tooth_namespace_creation_syncs_state_root_and_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        durability_probe::take();
+        s.write(
+            Namespace::Provider,
+            "anthropic",
+            &row(b"sk-ant-secret12345"),
+        )
+        .unwrap();
+        let synced = durability_probe::take();
+        assert_eq!(
+            synced,
+            vec![dir.path().to_path_buf(), dir.path().join("providers")],
+            "both state root and namespace dir must be synced in order"
+        );
+        assert_eq!(
+            fs::metadata(dir.path().join("providers")).unwrap().mode() & 0o777,
+            0o700
+        );
+
+        // If syncing the state root fails, the write is not acknowledged.
+        durability_probe::fail_dir(Some(dir.path().to_path_buf()));
+        let failed = s.write(Namespace::Service, "gh", &row(b"ghp_secret_0123456"));
+        durability_probe::fail_dir(None);
+        assert!(failed.is_err());
+
+        // A symlink planted at a namespace directory is refused.
+        let outside = tempfile::tempdir().unwrap();
+        let services = dir.path().join("services");
+        if services.exists() {
+            fs::remove_dir_all(&services).unwrap();
+        }
+        std::os::unix::fs::symlink(outside.path(), &services).unwrap();
+        assert!(s
+            .write(Namespace::Service, "gh", &row(b"ghp_secret_0123456"))
+            .is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        // Recursive state-directory creation syncs the deepest pre-existing
+        // ancestor and every newly created intermediate directory in order.
+        let root_canon = fs::canonicalize(dir.path()).unwrap();
+        let nested = dir.path().join("nested_a/nested_b/state");
+        durability_probe::take();
+        create_dir_all_0700_synced(&nested).unwrap();
+        let synced_nested = durability_probe::take();
+        assert_eq!(
+            synced_nested,
+            vec![
+                root_canon.clone(),
+                root_canon.join("nested_a"),
+                root_canon.join("nested_a/nested_b"),
+            ],
+            "every newly created directory entry up to pre-existing parent must be synced"
+        );
     }
 }

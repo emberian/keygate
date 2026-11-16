@@ -6,7 +6,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use keygate_broker::client::{Client, ExpectedBroker};
-use keygate_broker::engine::{CONFIG_FILE, MASTER_KEY_FILE};
+use keygate_broker::engine::CONFIG_FILE;
 use keygate_broker::harden;
 use keygate_broker::{Broker, BrokerOptions, Listeners};
 use keygate_core::config::{self, Config, Deployment};
@@ -228,12 +228,25 @@ fn read_source(path: &Path) -> Fallible<Vec<u8>> {
 
 impl TokenArgs {
     fn load(&self) -> Fallible<String> {
-        let raw = match &self.token_file {
-            Some(path) => String::from_utf8(read_source(path)?)?,
+        let mut raw = match &self.token_file {
+            Some(path) => {
+                let bytes = read_source(path)?;
+                match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        let utf8 = e.utf8_error();
+                        let mut bad = e.into_bytes();
+                        bad.zeroize();
+                        return Err(format!("token file is not valid UTF-8: {utf8}").into());
+                    }
+                }
+            }
             None => std::env::var("KEYGATE_TOKEN")
                 .map_err(|_| "no token: set KEYGATE_TOKEN or pass --token-file")?,
         };
-        Ok(raw.trim().to_owned())
+        let trimmed = raw.trim().to_owned();
+        raw.zeroize();
+        Ok(trimmed)
     }
 }
 
@@ -315,19 +328,32 @@ fn print_json<T: serde::Serialize>(value: &T) -> Fallible<()> {
 }
 
 fn init(state: &Path) -> Fallible<()> {
-    if state.join(MASTER_KEY_FILE).exists() {
-        return Err(format!("{} is already initialized", state.display()).into());
+    match Broker::init_state(state) {
+        Ok(()) => {}
+        Err(keygate_broker::BootError::Seal(keygate_core::seal::SealError::Io(e)))
+            if e.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            return Err(format!("{} is already initialized", state.display()).into());
+        }
+        Err(e) => return Err(e.into()),
     }
-    Broker::init_state(state)?;
     let config = state.join(CONFIG_FILE);
-    if !config.exists() {
-        // The initializing user is the broker's uid and its first operator.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&config)?
-            .write_all(config::example(harden::effective_uid()).as_bytes())?;
+    // `create_new(true)` (`O_CREAT | O_EXCL`) refuses both existing files and
+    // symlinks atomically without following them.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&config)
+    {
+        Ok(mut file) => {
+            // The initializing user is the broker's uid and its first operator.
+            file.write_all(config::example(harden::effective_uid()).as_bytes())?;
+            file.sync_all()?;
+            keygate_core::seal::sync_parent(&config)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
     }
     println!("initialized {}", state.display());
     println!("edit {} and run `keygate serve`", config.display());

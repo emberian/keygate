@@ -16,7 +16,7 @@ use crate::provider::{
 use crate::vault::{ActiveSecret, Prices, RowEpoch, Upstream, Vault};
 use crate::BootError;
 use bytes::Bytes;
-use keygate_core::audit::{AuditEvent, AuditLog};
+use keygate_core::audit::{AuditEvent, AuditFaults, AuditLog};
 use keygate_core::config::{header_is_reserved, BrokerCfg, Config, Deployment};
 use keygate_core::echo::{EchoAutomaton, EchoGuard};
 use keygate_core::journal::{
@@ -119,6 +119,9 @@ pub struct BrokerOptions {
     /// Storage fault injection for the ticket journal (tests only).
     #[doc(hidden)]
     pub journal_faults: Option<Arc<JournalFaults>>,
+    /// Storage fault injection for the audit log (tests only).
+    #[doc(hidden)]
+    pub audit_faults: Option<Arc<AuditFaults>>,
 }
 
 struct Inner {
@@ -140,6 +143,9 @@ struct Inner {
     /// Calls between a claimed ticket and its recorded outcome.
     flights: watch::Sender<usize>,
     started: Instant,
+    // Last field: release exclusive directory ownership only after every
+    // mutable state handle above has been dropped.
+    _state_lock: crate::harden::StateLock,
 }
 
 /// Async exchanges isolate durable operations on a bounded blocking pool.
@@ -148,6 +154,29 @@ struct Inner {
 #[derive(Clone)]
 pub struct Broker {
     inner: Arc<Inner>,
+}
+
+/// Non-owning handle held by idle transport connection loops so an idle
+/// keep-alive peer neither pins decrypted secrets nor retains `StateLock`
+/// after the broker has shut down and all active requests have finished.
+#[derive(Clone)]
+pub(crate) struct WeakBroker {
+    inner: std::sync::Weak<Inner>,
+}
+
+impl WeakBroker {
+    pub(crate) fn upgrade(&self) -> Option<Broker> {
+        self.inner.upgrade().map(|inner| Broker { inner })
+    }
+}
+
+/// Signals spawned connection tasks when a listener `serve` future is dropped.
+pub(crate) struct StopOnDrop(pub watch::Sender<bool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
 }
 
 /// A request that passed every stateless check.
@@ -168,10 +197,12 @@ struct Prepared {
     charges: Vec<Charge>,
     /// Token prices, present when the reply's usage should settle the reservation.
     prices: Option<Prices>,
-    /// The token's earliest `ExpiresAtUnixS`, and the clock reading it was
-    /// admitted against.
+    /// The token's earliest `ExpiresAtUnixS`, the integer wall-clock second
+    /// it was admitted against, and the exact monotonic deadline bound at
+    /// admission so durable delays never extend a capability's lifetime.
     expires_at_unix_s: Option<u64>,
     admitted_unix_s: u64,
+    expires_at: Option<tokio::time::Instant>,
 }
 
 /// A claimed ticket with its `Begin` audited: the network may now be used.
@@ -222,6 +253,12 @@ impl CutWatch {
             }
             if *self.shutdown.borrow_and_update() {
                 return Cut::Shutdown;
+            }
+            if self
+                .expires
+                .is_some_and(|at| tokio::time::Instant::now() >= at)
+            {
+                return Cut::Expired;
             }
             let expiry = async {
                 match self.expires {
@@ -280,22 +317,25 @@ impl Drop for FlightGuard {
             let broker = self.broker.clone();
             let id = self.id;
             let counted = self.counted.take();
+            let cleanup = move |broker: &Broker| {
+                let _counted = counted;
+                if let Err(e) = broker.record(id, TicketState::Uncertain) {
+                    eprintln!("keygate: ticket {id} abandoned and not journaled: {e}");
+                }
+                broker.audit_lossy(&AuditEvent::Failed {
+                    ticket: id,
+                    reason: "abandoned mid-flight; marked uncertain",
+                });
+            };
             // Cancellation must never block a relay worker. Until this durable
             // cleanup runs the ticket stays InFlight and cannot be re-sent.
-            tokio::spawn(async move {
-                broker
-                    .disk(move |broker| {
-                        if let Err(e) = broker.record(id, TicketState::Uncertain) {
-                            eprintln!("keygate: ticket {id} abandoned and not journaled: {e}");
-                        }
-                        broker.audit_lossy(&AuditEvent::Failed {
-                            ticket: id,
-                            reason: "abandoned mid-flight; marked uncertain",
-                        });
-                    })
-                    .await;
-                drop(counted);
-            });
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    broker.disk(cleanup).await;
+                });
+            } else {
+                cleanup(&broker);
+            }
         }
     }
 }
@@ -314,14 +354,10 @@ enum ExchangeError {
 impl Broker {
     /// Create the state directory skeleton and a fresh master key.
     pub fn init_state(state_dir: &Path) -> Result<(), BootError> {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(state_dir)?;
-        // The directory may have existed already, with a wider mode.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))?;
+        keygate_core::seal::create_dir_all_0700_synced(state_dir)?;
+        let broker_uid = crate::harden::effective_uid();
+        let state_dir = crate::harden::check_state_dir(state_dir, broker_uid)?;
+        let _state_lock = crate::harden::StateLock::acquire(&state_dir, broker_uid)?;
         MasterKey::generate(&state_dir.join(MASTER_KEY_FILE))?;
         Ok(())
     }
@@ -334,8 +370,10 @@ impl Broker {
         config.validate()?;
         let broker_uid = crate::harden::effective_uid();
         // From here on only the canonical path is used: it is the one whose
-        // every ancestor was just checked.
+        // every ancestor was just checked. Acquire exclusive state ownership
+        // before reading or recovering any mutable file.
         let state_dir = &crate::harden::check_state_dir(state_dir, broker_uid)?;
+        let state_lock = crate::harden::StateLock::acquire(state_dir, broker_uid)?;
         let master = MasterKey::load(&state_dir.join(MASTER_KEY_FILE))?;
         let vault = Vault::open(&config, SealStore::new(state_dir, &master))?;
         let journal = Journal::open_with_faults(
@@ -347,13 +385,16 @@ impl Broker {
         journal.set_max_uncertain(config.broker.max_uncertain_tickets);
         let audit = match options.audit {
             Some(audit) => audit,
-            None => AuditLog::open(&state_dir.join(AUDIT_FILE))?,
+            None => AuditLog::open_with_faults(&state_dir.join(AUDIT_FILE), options.audit_faults)?,
         };
-        let seats = match std::fs::read(state_dir.join(SEATS_FILE)) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
+        let seats = match crate::harden::read_state_file(
+            &state_dir.join(SEATS_FILE),
+            broker_uid,
+            16 << 20,
+        )? {
+            Some(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| BootError::Config(format!("{SEATS_FILE}: {e}")))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => return Err(e.into()),
+            None => BTreeMap::new(),
         };
         // `validate` guarantees a separated deployment lists its operators;
         // only a development broker falls back to the state dir's owner.
@@ -401,6 +442,7 @@ impl Broker {
                 shutdown: watch::Sender::new(false),
                 flights: watch::Sender::new(0),
                 started: Instant::now(),
+                _state_lock: state_lock,
             }),
         })
     }
@@ -754,6 +796,16 @@ impl Broker {
         self.in_flight()
     }
 
+    pub(crate) fn downgrade(&self) -> WeakBroker {
+        WeakBroker {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub(crate) fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.inner.shutdown.subscribe()
+    }
+
     // ----- admission --------------------------------------------------------
 
     /// Decide whether a call should be handled as a stream: a provider call
@@ -877,8 +929,13 @@ impl Broker {
         kind: CallKind,
         mode: HeaderMode,
     ) -> Result<Prepared, Refusal> {
+        // Capture both clocks up front so journal or audit contention never
+        // grants extra lifetime to a short-lived capability.
+        let admitted_at = tokio::time::Instant::now();
+        let admitted_wall = keygate_core::clock_from(std::time::SystemTime::now())
+            .map_err(|e| Refusal::new(Code::ClockFailed, e.to_string()))?;
         let vault = &self.inner.vault;
-        let now = self.now()?;
+        let now = admitted_wall.as_secs();
         let verified = self.verify_token(&call.token, caller)?;
         let seat = verified.root.seat.clone();
 
@@ -996,6 +1053,18 @@ impl Broker {
             }));
         }
 
+        let expires_at = verified
+            .expires_at_unix_s()
+            .map(|expiry| {
+                let remaining = Duration::from_secs(expiry).saturating_sub(admitted_wall);
+                admitted_at.checked_add(remaining).ok_or_else(|| {
+                    Refusal::new(
+                        Code::Denied,
+                        "token expiry cannot be represented by the monotonic clock",
+                    )
+                })
+            })
+            .transpose()?;
         let digest = request_digest(ns, kind, &call, method.as_str(), query, &headers, &verified);
         Ok(Prepared {
             ns,
@@ -1015,6 +1084,7 @@ impl Broker {
             prices: admission.prices,
             expires_at_unix_s: verified.expires_at_unix_s(),
             admitted_unix_s: now,
+            expires_at,
         })
     }
 
@@ -1063,6 +1133,14 @@ impl Broker {
 
     /// Steps 3 and 4: claim the ticket and audit `Begin`. No network yet.
     fn begin(&self, p: &Prepared, id: TicketId) -> Result<Flight, Refusal> {
+        if p.expires_at
+            .is_some_and(|at| tokio::time::Instant::now() >= at)
+        {
+            return Err(Refusal::new(
+                Code::Denied,
+                "the token expired before the request could begin",
+            ));
+        }
         let upstream = self.inner.vault.upstream(p.ns, &p.row)?;
         let Some((secret, automaton)) = self.inner.vault.snapshot(upstream) else {
             let epoch = upstream.epoch();
@@ -1128,15 +1206,9 @@ impl Broker {
             self.record(id, TicketState::Live)?;
             return Err(audit_refusal(e));
         }
-        // Only streams are cut at expiry; a buffered call is already
-        // bounded by `buffered_timeout_ms`.
-        let expires = p
-            .expires_at_unix_s
-            .filter(|_| p.kind == CallKind::Stream)
-            .and_then(|at| {
-                let left = Duration::from_secs(at.saturating_sub(p.admitted_unix_s));
-                tokio::time::Instant::now().checked_add(left)
-            });
+        // Only streams are cut at expiry; a buffered call already in flight
+        // is bounded by `buffered_timeout_ms`.
+        let expires = p.expires_at.filter(|_| p.kind == CallKind::Stream);
         let watch = CutWatch {
             epoch,
             generation: secret.generation,
@@ -2213,5 +2285,98 @@ stream_paths = ["/events"]
         assert!(
             matches!(live.items.recv().await, Some(StreamItem::End(summary)) if summary.complete)
         );
+    }
+
+    /// #tooth (K-A5): durable delays after `prepare` never restart a token's
+    /// expiry countdown. A call whose token expires before `begin` runs is
+    /// refused before claiming or auditing `Begin`, and a stream whose bound
+    /// deadline elapses after `begin` cuts immediately on the first poll.
+    #[tokio::test]
+    async fn tooth_begin_and_cut_watch_do_not_restart_expiry_after_admission_delay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_dir, broker) = test_broker(&format!("http://{}", listener.local_addr().unwrap()));
+        let caller = Caller { uid: None };
+        let expires = unix_time().unwrap() + 1;
+        let token = broker
+            .mint("seat", None, vec![Caveat::ExpiresAtUnixS(expires)], caller)
+            .unwrap();
+        let call = Call {
+            token,
+            row: "api".into(),
+            method: "GET".into(),
+            path: "/events".into(),
+            query: None,
+            headers: vec![],
+            body: vec![],
+            request_id: None,
+            last_event_id: None,
+        };
+        let p = broker
+            .prepare(
+                Namespace::Service,
+                caller,
+                call,
+                CallKind::Stream,
+                HeaderMode::Strict,
+            )
+            .unwrap();
+        // Stand in for journal/audit contention after prepare.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(unix_time().unwrap() >= expires);
+        let err = broker
+            .disk(move |b| {
+                let (ticket, _) = b.open_ticket(&p).unwrap();
+                b.begin(&p, ticket.id).map(|_| ())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Code::Denied);
+
+        // Even if `begin` ran just before the deadline and the runtime only
+        // polls `CutWatch` after it has passed, the first poll cuts without
+        // waiting on a fresh countdown.
+        let expires_soon = unix_time().unwrap() + 2;
+        let token2 = broker
+            .mint(
+                "seat",
+                None,
+                vec![Caveat::ExpiresAtUnixS(expires_soon)],
+                caller,
+            )
+            .unwrap();
+        let call2 = Call {
+            token: token2,
+            row: "api".into(),
+            method: "GET".into(),
+            path: "/events".into(),
+            query: None,
+            headers: vec![],
+            body: vec![],
+            request_id: Some("second".into()),
+            last_event_id: None,
+        };
+        let mut flight = broker
+            .disk(move |b| {
+                let p = b
+                    .prepare(
+                        Namespace::Service,
+                        caller,
+                        call2,
+                        CallKind::Stream,
+                        HeaderMode::Strict,
+                    )
+                    .unwrap();
+                let (ticket, _) = b.open_ticket(&p).unwrap();
+                b.begin(&p, ticket.id).unwrap()
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(5), flight.watch.cut())
+                .await
+                .expect("expired watch must cut on first poll"),
+            Cut::Expired
+        );
+        flight.guard.finish(TicketState::Uncertain).await.unwrap();
     }
 }

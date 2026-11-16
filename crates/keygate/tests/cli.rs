@@ -38,12 +38,36 @@ fn upstream() -> (String, Arc<Mutex<Vec<String>>>) {
     (origin, heads)
 }
 
-struct Daemon(Child);
+struct Daemon(Option<Child>);
+
+impl Daemon {
+    fn new(child: Child) -> Self {
+        Daemon(Some(child))
+    }
+
+    fn id(&self) -> u32 {
+        self.0.as_ref().expect("live child").id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.as_mut().expect("live child").try_wait()
+    }
+
+    fn into_output(mut self) -> Output {
+        self.0
+            .take()
+            .expect("live child")
+            .wait_with_output()
+            .unwrap()
+    }
+}
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -58,19 +82,24 @@ fn keygate(state: &Path) -> Command {
 }
 
 fn run(command: &mut Command, stdin: &str) -> Output {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+    let mut child = Daemon::new(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.as_mut().unwrap().stdin.take().unwrap();
+    if let Err(e) = input.write_all(stdin.as_bytes()) {
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "unexpected stdin write error: {e}"
+        );
+    }
+    drop(input);
+    child.into_output()
 }
 
 fn ok(command: &mut Command, stdin: &str) -> String {
@@ -100,7 +129,7 @@ fn tooth_cli_init_serve_set_mint_attenuate_forward_revoke() {
     )
     .unwrap();
 
-    let _daemon = Daemon(
+    let _daemon = Daemon::new(
         keygate(&state)
             .arg("serve")
             .stdin(Stdio::null())
@@ -129,6 +158,21 @@ fn tooth_cli_init_serve_set_mint_attenuate_forward_revoke() {
         "ok"
     );
     assert!(ok(keygate(&state).arg("ls"), "").contains("active"));
+
+    // Invalid UTF-8 in `--token-file` fails cleanly without echoing raw bytes.
+    let bad_token_file = dir.path().join("bad-token.bin");
+    std::fs::write(&bad_token_file, b"kgm_secret\xff\xfesuffix").unwrap();
+    let bad_out = run(
+        keygate(&state)
+            .args(["forward", "service", "gh", "GET", "/repos"])
+            .arg("--token-file")
+            .arg(&bad_token_file),
+        "",
+    );
+    assert!(!bad_out.status.success());
+    let bad_err = String::from_utf8_lossy(&bad_out.stderr);
+    assert!(bad_err.contains("not valid UTF-8"), "{bad_err}");
+    assert!(!bad_err.contains("kgm_secret"), "{bad_err}");
 
     let root = ok(
         keygate(&state).args([
@@ -251,7 +295,7 @@ fn start(state: &Path, config: Option<&str>) -> Daemon {
     if let Some(config) = config {
         std::fs::write(state.join("keygate.toml"), config).unwrap();
     }
-    let daemon = Daemon(
+    let daemon = Daemon::new(
         keygate(state)
             .arg("serve")
             .stdin(Stdio::null())
@@ -276,22 +320,23 @@ fn start(state: &Path, config: Option<&str>) -> Daemon {
 /// running after ten seconds (a broker that started when it should have
 /// refused), it is killed and reported as having succeeded.
 fn exits(command: &mut Command) -> Output {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = Daemon::new(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
+            drop(child);
             return Command::new("true").output().unwrap();
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    child.wait_with_output().unwrap()
+    child.into_output()
 }
 
 fn stderr(output: &Output) -> String {
@@ -311,14 +356,13 @@ fn tooth_serve_hardens_the_process_and_checks_custody() {
     let config =
         format!("{DEV}[services.gh]\norigin = \"{origin}\"\nbuffered_paths = [\"/repos\"]\n");
     let daemon = start(&state, Some(&config));
-    let pid = daemon.0.id();
+    let pid = daemon.id();
 
     // Control: an ordinary process of ours is readable through /proc.
-    let mut plain = Command::new("sleep").arg("30").spawn().unwrap();
+    let plain = Daemon::new(Command::new("sleep").arg("30").spawn().unwrap());
     assert!(std::fs::read(format!("/proc/{}/environ", plain.id())).is_ok());
     assert!(std::fs::File::open(format!("/proc/{}/mem", plain.id())).is_ok());
-    plain.kill().unwrap();
-    plain.wait().unwrap();
+    drop(plain);
 
     // The broker is not: PR_SET_DUMPABLE=0 hands its /proc entries to root,
     // which also means no ptrace attach and no core file from this uid.
@@ -340,7 +384,22 @@ fn tooth_serve_hardens_the_process_and_checks_custody() {
         ["0", "0"],
         "{core}"
     );
-    // It still works.
+    // It still works, and both duplicate `serve` and `init` refuse while
+    // the running daemon holds the state lock.
+    let dup_serve = exits(keygate(&state).arg("serve"));
+    assert!(!dup_serve.status.success());
+    assert!(
+        stderr(&dup_serve).contains("already owned by a running broker"),
+        "{}",
+        stderr(&dup_serve)
+    );
+    let dup_init = exits(keygate(&state).arg("init"));
+    assert!(!dup_init.status.success());
+    assert!(
+        stderr(&dup_init).contains("already owned by a running broker"),
+        "{}",
+        stderr(&dup_init)
+    );
     assert!(ok(keygate(&state).arg("ls"), "").contains("unset"));
     drop(daemon);
 

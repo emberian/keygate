@@ -607,6 +607,7 @@ async fn tooth_stream_is_cut_when_its_token_expires() {
     let up = Upstream::start(move |_| script.next()).await;
     let rig = Rig::new(&config(&up.origin));
     let root = rig.token("seat-a");
+    let started = Instant::now();
     let short = attenuate(&root, Caveat::ExpiresAtUnixS(now_unix_s() + 2));
 
     let mut expiring = rig
@@ -615,7 +616,6 @@ async fn tooth_stream_is_cut_when_its_token_expires() {
     let mut lasting = rig
         .live(S, fresh(call(&root, "api", "GET", "/events", b"")))
         .await;
-    let started = Instant::now();
     senders[0].send(bytes("data: one\n\n")).unwrap();
     assert_eq!(next_chunk(&mut expiring).await, "data: one\n\n");
 

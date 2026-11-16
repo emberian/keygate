@@ -17,7 +17,9 @@
 //! alone when it announces more), and both the head and the body must
 //! arrive within `request_read_timeout_ms`.
 
-use crate::engine::{Broker, Caller, HeaderMode, StreamItem, StreamOutcome};
+use crate::engine::{
+    Broker, Caller, HeaderMode, StopOnDrop, StreamItem, StreamOutcome, WeakBroker,
+};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Either, Full, Limited};
 use hyper::body::{Body, Frame, Incoming};
@@ -37,7 +39,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 
 /// Headers a token may arrive in. All are stripped before forwarding.
 const TOKEN_HEADERS: &[&str] = &["authorization", "x-api-key", "x-goog-api-key"];
@@ -69,6 +71,11 @@ pub async fn serve(broker: Broker, listener: TcpListener) -> io::Result<()> {
         ));
     }
     let connections = Arc::new(Semaphore::new(broker.config().max_connections));
+    let head_deadline = Duration::from_millis(broker.config().request_read_timeout_ms);
+    let weak = broker.downgrade();
+    let shutdown = broker.subscribe_shutdown();
+    let (stop_tx, _) = watch::channel(false);
+    let _stop = StopOnDrop(stop_tx);
     loop {
         let permit = connections
             .clone()
@@ -77,18 +84,33 @@ pub async fn serve(broker: Broker, listener: TcpListener) -> io::Result<()> {
             .expect("connection semaphore stays open");
         match listener.accept().await {
             Ok((stream, _)) => {
-                let broker = broker.clone();
+                let weak = weak.clone();
+                let mut stop_rx = _stop.0.subscribe();
+                let mut shutdown_rx = shutdown.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let head_deadline =
-                        Duration::from_millis(broker.config().request_read_timeout_ms);
-                    let service = service_fn(move |request| handle(broker.clone(), request));
-                    let _ = hyper::server::conn::http1::Builder::new()
+                    let service = service_fn(move |request| handle(weak.clone(), request));
+                    let conn = hyper::server::conn::http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(head_deadline)
                         .max_buf_size(MAX_HEAD_BYTES)
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await;
+                        .serve_connection(TokioIo::new(stream), service);
+                    tokio::pin!(conn);
+                    let mut closing = false;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = &mut conn => break,
+                            _ = stop_rx.wait_for(|&s| s), if !closing => {
+                                closing = true;
+                                conn.as_mut().graceful_shutdown();
+                            }
+                            _ = shutdown_rx.wait_for(|&s| s), if !closing => {
+                                closing = true;
+                                conn.as_mut().graceful_shutdown();
+                            }
+                        }
+                    }
                 });
             }
             Err(e) => {
@@ -100,9 +122,15 @@ pub async fn serve(broker: Broker, listener: TcpListener) -> io::Result<()> {
 }
 
 async fn handle(
-    broker: Broker,
+    weak: WeakBroker,
     request: Request<Incoming>,
 ) -> Result<Response<GatewayBody>, Infallible> {
+    let Some(broker) = weak.upgrade() else {
+        return Ok(refusal_response(&Refusal::new(
+            Code::ShuttingDown,
+            "the broker is shutting down and takes no new calls",
+        )));
+    };
     Ok(route(broker, request)
         .await
         .unwrap_or_else(|refusal| refusal_response(&refusal)))

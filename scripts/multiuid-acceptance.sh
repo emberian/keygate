@@ -101,6 +101,15 @@ methods = ["GET", "POST"]
 buffered_paths = ["/api"]
 max_request_bytes = 4096
 CONFIG
+broker=""
+planted=""
+cleanup() {
+    [ -n "$planted" ] && kill "$planted" 2>/dev/null || true
+    [ -n "$broker" ] && kill "$broker" 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+trap cleanup EXIT
+
 "$kg" --state "$state" serve >"$pub/broker.log" 2>&1 </dev/null &
 broker=$!
 for _ in $(seq 1 200); do
@@ -165,6 +174,7 @@ s = socket.socket(socket.AF_UNIX); s.bind("/tmp/planted/keygate.sock"); s.listen
 open("/tmp/planted/ready", "w").close()
 c, _ = s.accept(); got = c.recv(65536)
 open("/tmp/planted/captured", "wb").write(got); time.sleep(5)' &
+    planted=$!
     for _ in $(seq 1 200); do [ -e /tmp/planted/ready ] && break; sleep 0.02; done
     refused 'neither root nor' bash -c "printf operator-secret-must-not-leak-01 | $kg --socket /tmp/planted/keygate.sock set service fixture"
     refused 'not the expected uid' bash -c "printf operator-secret-must-not-leak-01 | $kg --socket /tmp/planted/keygate.sock --broker-uid 0 set service fixture"
