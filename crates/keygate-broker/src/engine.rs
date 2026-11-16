@@ -33,7 +33,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use zeroize::Zeroize;
 
 /// Caller headers forwarded on every row without configuration.
@@ -123,10 +123,15 @@ struct Inner {
     http: reqwest::Client,
     root_key: SecretBytes,
     operator_uids: Vec<u32>,
-    seats: Mutex<BTreeMap<String, u64>>,
+    seats: watch::Sender<Arc<BTreeMap<String, u64>>>,
+    seat_admin: Mutex<()>,
+    disk_slots: Arc<Semaphore>,
     started: Instant,
 }
 
+/// Async exchanges isolate durable operations on a bounded blocking pool.
+/// Synchronous operator/diagnostic methods also perform disk I/O or acquire
+/// its locks; embedders should call those from a blocking thread.
 #[derive(Clone)]
 pub struct Broker {
     inner: Arc<Inner>,
@@ -138,6 +143,7 @@ struct Prepared {
     row: String,
     kind: CallKind,
     seat: String,
+    root_epoch: u64,
     uid: Option<u32>,
     digest: RequestDigest32,
     method: reqwest::Method,
@@ -156,6 +162,10 @@ struct Flight {
     guard: FlightGuard,
     secret: Arc<ActiveSecret>,
     epoch: watch::Receiver<RowEpoch>,
+    seat_epoch: watch::Receiver<Arc<BTreeMap<String, u64>>>,
+    seat: String,
+    root_epoch: u64,
+    automaton: Arc<EchoAutomaton>,
 }
 
 /// Owns an `InFlight` ticket. If it is dropped without an explicit outcome
@@ -168,24 +178,36 @@ struct FlightGuard {
 }
 
 impl FlightGuard {
-    fn finish(mut self, state: TicketState) -> Result<(), Refusal> {
-        self.armed = false;
-        self.broker.record(self.id, state)
+    async fn finish(mut self, state: TicketState) -> Result<(), Refusal> {
+        let broker = self.broker.clone();
+        broker
+            .disk(move |_| {
+                self.armed = false;
+                self.broker.record(self.id, state)
+            })
+            .await
     }
 }
 
 impl Drop for FlightGuard {
     fn drop(&mut self) {
         if self.armed {
-            if let Err(e) = self.broker.record(self.id, TicketState::Uncertain) {
-                eprintln!(
-                    "keygate: ticket {} abandoned mid-flight and not journaled: {e}",
-                    self.id
-                );
-            }
-            self.broker.audit_lossy(&AuditEvent::Failed {
-                ticket: self.id,
-                reason: "abandoned mid-flight; marked uncertain",
+            let broker = self.broker.clone();
+            let id = self.id;
+            // Cancellation must never block a relay worker. Until this durable
+            // cleanup runs the ticket stays InFlight and cannot be re-sent.
+            tokio::spawn(async move {
+                broker
+                    .disk(move |broker| {
+                        if let Err(e) = broker.record(id, TicketState::Uncertain) {
+                            eprintln!("keygate: ticket {id} abandoned and not journaled: {e}");
+                        }
+                        broker.audit_lossy(&AuditEvent::Failed {
+                            ticket: id,
+                            reason: "abandoned mid-flight; marked uncertain",
+                        });
+                    })
+                    .await;
             });
         }
     }
@@ -222,7 +244,11 @@ impl Broker {
         config.validate()?;
         let master = MasterKey::load(&state_dir.join(MASTER_KEY_FILE))?;
         let vault = Vault::open(&config, SealStore::new(state_dir, &master))?;
-        let journal = Journal::open(&state_dir.join(JOURNAL_FILE), config.broker.compact_every)?;
+        let journal = Journal::open(
+            &state_dir.join(JOURNAL_FILE),
+            config.broker.compact_every,
+            config.broker.retention_s,
+        )?;
         let audit = match options.audit {
             Some(audit) => audit,
             None => AuditLog::open(&state_dir.join(AUDIT_FILE))?,
@@ -258,10 +284,34 @@ impl Broker {
                 http,
                 root_key: master.derive(macaroon::ROOT_KEY_CONTEXT),
                 operator_uids,
-                seats: Mutex::new(seats),
+                seats: watch::Sender::new(Arc::new(seats)),
+                seat_admin: Mutex::new(()),
+                disk_slots: Arc::new(Semaphore::new(16)),
                 started: Instant::now(),
             }),
         })
+    }
+
+    /// Bound queued durable work before using Tokio's blocking pool. The
+    /// permit remains owned by the job even if its async caller is cancelled.
+    pub(crate) async fn disk<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Broker) -> T + Send + 'static,
+    ) -> T {
+        let permit = self
+            .inner
+            .disk_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("disk semaphore stays open");
+        let broker = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(&broker)
+        })
+        .await
+        .expect("broker disk job panicked")
     }
 
     pub fn config(&self) -> &BrokerCfg {
@@ -296,13 +346,7 @@ impl Broker {
     }
 
     fn seat_epoch(&self, seat: &str) -> u64 {
-        self.inner
-            .seats
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(seat)
-            .copied()
-            .unwrap_or(0)
+        self.inner.seats.borrow().get(seat).copied().unwrap_or(0)
     }
 
     fn retention_deadline(&self) -> u64 {
@@ -310,9 +354,14 @@ impl Broker {
     }
 
     fn record(&self, id: TicketId, state: TicketState) -> Result<(), Refusal> {
+        let deadline = if state == TicketState::Live {
+            now_unix_s().saturating_add(self.inner.cfg.live_ttl_s)
+        } else {
+            self.retention_deadline()
+        };
         self.inner
             .journal
-            .transition(id, state, self.retention_deadline())
+            .transition(id, state, deadline)
             .map_err(|e| Refusal::new(Code::JournalFailed, format!("journal write failed: {e}")))
     }
 
@@ -321,6 +370,14 @@ impl Broker {
     fn audit_lossy(&self, event: &AuditEvent<'_>) {
         if let Err(e) = self.inner.audit.append(event) {
             eprintln!("keygate: audit append failed after the fact: {e}");
+        }
+    }
+
+    fn settle(&self, id: TicketId, actual: Option<u64>) {
+        if let Some(actual) = actual {
+            if let Err(e) = self.inner.journal.settle(id, actual) {
+                eprintln!("keygate: ticket {id} keeps its reservation; settling failed: {e}");
+            }
         }
     }
 
@@ -437,27 +494,43 @@ impl Broker {
         if !valid_name(seat) {
             return Err(Refusal::new(Code::BadRequest, "invalid seat name"));
         }
-        let mut seats = self.inner.seats.lock().unwrap_or_else(|p| p.into_inner());
-        let mut next = seats.clone();
-        let epoch = next.get(seat).copied().unwrap_or(0) + 1;
+        let _admin = self
+            .inner
+            .seat_admin
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut next = (**self.inner.seats.borrow()).clone();
+        let epoch = next
+            .get(seat)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| Refusal::new(Code::Internal, "seat epoch exhausted"))?;
         next.insert(seat.to_owned(), epoch);
+        // Cut live calls before disk I/O, just like row revocation.
+        self.inner.seats.send_replace(Arc::new(next.clone()));
         let bytes = serde_json::to_vec_pretty(&next)
             .map_err(|e| Refusal::new(Code::Internal, e.to_string()))?;
-        write_atomic(&self.inner.state_dir.join(SEATS_FILE), &bytes).map_err(|e| {
-            Refusal::new(
-                Code::Internal,
-                format!("persisting seat epochs failed; nothing changed: {e}"),
-            )
-        })?;
-        *seats = next;
-        drop(seats);
-        self.audit_lossy(&AuditEvent::Admin {
+        let persisted = write_atomic(&self.inner.state_dir.join(SEATS_FILE), &bytes);
+        let audited = self.inner.audit.append(&AuditEvent::Admin {
             action: "revoke-seat",
             uid: by.uid,
             namespace: None,
             target: seat,
             detail: "",
         });
+        persisted.map_err(|e| {
+            Refusal::new(
+                Code::Internal,
+                format!("seat IS revoked in memory, but persisting its epoch failed: {e}"),
+            )
+        })?;
+        audited.map_err(|e| {
+            Refusal::new(
+                Code::AuditFailed,
+                format!("seat IS revoked, but the audit record failed: {e}"),
+            )
+        })?;
         Ok(epoch)
     }
 
@@ -677,6 +750,7 @@ impl Broker {
             row: call.row,
             kind,
             seat,
+            root_epoch: verified.root.root_epoch,
             uid: caller.uid,
             digest,
             method,
@@ -702,7 +776,7 @@ impl Broker {
                 charges: p.charges.clone(),
                 reserve_micro_usd: p.reserve_micro_usd,
                 now_unix_s: now_unix_s(),
-                retention_s: self.inner.cfg.retention_s,
+                live_ttl_s: self.inner.cfg.live_ttl_s,
             })
             .map_err(|e| match e {
                 JournalError::Budget { .. } => Refusal::new(Code::BudgetExceeded, e.to_string()),
@@ -731,7 +805,7 @@ impl Broker {
     /// Steps 3 and 4: claim the ticket and audit `Begin`. No network yet.
     fn begin(&self, p: &Prepared, id: TicketId) -> Result<Flight, Refusal> {
         let upstream = self.inner.vault.upstream(p.ns, &p.row)?;
-        let Some(secret) = upstream.secret() else {
+        let Some((secret, automaton)) = self.inner.vault.snapshot(upstream) else {
             let epoch = upstream.epoch();
             return Err(if epoch.revoked_floor > epoch.generation {
                 Refusal::new(
@@ -795,6 +869,10 @@ impl Broker {
             guard,
             secret,
             epoch,
+            seat_epoch: self.inner.seats.subscribe(),
+            seat: p.seat.clone(),
+            root_epoch: p.root_epoch,
+            automaton,
         })
     }
 
@@ -837,6 +915,27 @@ impl Broker {
         })
     }
 
+    async fn prepare_flight(
+        &self,
+        ns: Namespace,
+        caller: Caller,
+        call: Call,
+        kind: CallKind,
+        mode: HeaderMode,
+    ) -> Result<(Prepared, Ticket, Option<Flight>), Refusal> {
+        self.disk(move |broker| {
+            let p = broker.prepare(ns, caller, call, kind, mode)?;
+            let (ticket, _) = broker.open_ticket(&p)?;
+            let flight = if ticket.state == TicketState::Live {
+                Some(broker.begin(&p, ticket.id)?)
+            } else {
+                None
+            };
+            Ok((p, ticket, flight))
+        })
+        .await
+    }
+
     // ----- buffered ---------------------------------------------------------
 
     /// Send a buffered call, or replay its retained reply on exact retry.
@@ -847,8 +946,9 @@ impl Broker {
         call: Call,
         mode: HeaderMode,
     ) -> Result<BufferedReply, Refusal> {
-        let p = self.prepare(ns, caller, call, CallKind::Buffered, mode)?;
-        let (ticket, _) = self.open_ticket(&p)?;
+        let (p, ticket, flight) = self
+            .prepare_flight(ns, caller, call, CallKind::Buffered, mode)
+            .await?;
         match ticket.state {
             TicketState::Live => {}
             TicketState::Replayable(retained) => {
@@ -863,13 +963,13 @@ impl Broker {
             _ => return Err(not_live(&ticket)),
         }
 
-        let mut flight = self.begin(&p, ticket.id)?;
+        let mut flight = flight.expect("Live ticket was claimed");
         let upstream = self.inner.vault.upstream(p.ns, &p.row)?;
         let generation = flight.secret.generation;
         let outcome = tokio::select! {
             biased;
-            _ = wait_revoked(&mut flight.epoch, generation) => Err(ExchangeError::Revoked),
-            outcome = self.buffered_exchange(&p, &flight.secret, upstream) => outcome,
+            _ = wait_revoked(&mut flight.epoch, generation, &mut flight.seat_epoch, &flight.seat, flight.root_epoch) => Err(ExchangeError::Revoked),
+            outcome = self.buffered_exchange(&p, &flight.secret, upstream, &flight.automaton) => outcome,
         };
 
         let id = ticket.id;
@@ -882,31 +982,36 @@ impl Broker {
                     body: retained.body.clone(),
                     replayed: false,
                 };
-                flight.guard.finish(TicketState::Replayable(retained))?;
-                if let Some(actual) = p
+                flight
+                    .guard
+                    .finish(TicketState::Replayable(retained))
+                    .await?;
+                let actual = p
                     .prices
-                    .and_then(|prices| metered_cost(&reply.body, prices))
-                {
-                    if let Err(e) = self.inner.journal.settle(id, actual) {
-                        eprintln!(
-                            "keygate: ticket {id} keeps its reservation; settling failed: {e}"
-                        );
-                    }
-                }
-                self.audit_lossy(&AuditEvent::End {
-                    ticket: id,
-                    status: reply.status,
-                    bytes: reply.body.len() as u64,
-                    withheld: false,
-                });
+                    .and_then(|prices| metered_cost(&reply.body, prices));
+                let status = reply.status;
+                let bytes = reply.body.len() as u64;
+                self.disk(move |broker| {
+                    broker.settle(id, actual);
+                    broker.audit_lossy(&AuditEvent::End {
+                        ticket: id,
+                        status,
+                        bytes,
+                        withheld: false,
+                    });
+                })
+                .await;
                 Ok(reply)
             }
             Err(ExchangeError::Connect(why)) => {
-                flight.guard.finish(TicketState::Live)?;
-                self.audit_lossy(&AuditEvent::Failed {
-                    ticket: id,
-                    reason: "connect failed; nothing sent",
-                });
+                flight.guard.finish(TicketState::Live).await?;
+                self.disk(move |b| {
+                    b.audit_lossy(&AuditEvent::Failed {
+                        ticket: id,
+                        reason: "connect failed; nothing sent",
+                    })
+                })
+                .await;
                 Err(Refusal::new(
                     Code::UpstreamFailed,
                     format!(
@@ -915,13 +1020,19 @@ impl Broker {
                 ))
             }
             Err(ExchangeError::Withheld { status }) => {
-                flight.guard.finish(TicketState::Withheld { status })?;
-                self.audit_lossy(&AuditEvent::End {
-                    ticket: id,
-                    status,
-                    bytes: 0,
-                    withheld: true,
-                });
+                flight
+                    .guard
+                    .finish(TicketState::Withheld { status })
+                    .await?;
+                self.disk(move |b| {
+                    b.audit_lossy(&AuditEvent::End {
+                        ticket: id,
+                        status,
+                        bytes: 0,
+                        withheld: true,
+                    })
+                })
+                .await;
                 Err(withheld_refusal())
             }
             Err(failure) => {
@@ -941,11 +1052,15 @@ impl Broker {
                         unreachable!("handled above")
                     }
                 };
-                flight.guard.finish(TicketState::Uncertain)?;
-                self.audit_lossy(&AuditEvent::Failed {
-                    ticket: id,
-                    reason: &reason,
-                });
+                flight.guard.finish(TicketState::Uncertain).await?;
+                let audit_reason = reason.clone();
+                self.disk(move |b| {
+                    b.audit_lossy(&AuditEvent::Failed {
+                        ticket: id,
+                        reason: &audit_reason,
+                    })
+                })
+                .await;
                 Err(Refusal::new(
                     code,
                     format!(
@@ -961,11 +1076,11 @@ impl Broker {
         p: &Prepared,
         secret: &ActiveSecret,
         upstream: &Upstream,
+        automaton: &EchoAutomaton,
     ) -> Result<Retained, ExchangeError> {
-        let automaton = self.inner.vault.guard();
         let mut response = self.send(p, secret, upstream).await?;
         let status = response.status().as_u16();
-        if !head_is_clean(&automaton, &response) {
+        if !head_is_clean(automaton, &response) {
             return Err(ExchangeError::Withheld { status });
         }
         let headers = caller_visible_headers(response.headers());
@@ -1002,8 +1117,9 @@ impl Broker {
         call: Call,
         mode: HeaderMode,
     ) -> Result<StreamOutcome, Refusal> {
-        let p = self.prepare(ns, caller, call, CallKind::Stream, mode)?;
-        let (ticket, _) = self.open_ticket(&p)?;
+        let (p, ticket, flight) = self
+            .prepare_flight(ns, caller, call, CallKind::Stream, mode)
+            .await?;
         let id = ticket.id;
         match ticket.state {
             TicketState::Live => {}
@@ -1016,22 +1132,25 @@ impl Broker {
             _ => return Err(not_live(&ticket)),
         }
 
-        let mut flight = self.begin(&p, id)?;
+        let mut flight = flight.expect("Live ticket was claimed");
         let upstream = self.inner.vault.upstream(p.ns, &p.row)?;
         let generation = flight.secret.generation;
         let sent = tokio::select! {
             biased;
-            _ = wait_revoked(&mut flight.epoch, generation) => Err(ExchangeError::Revoked),
+            _ = wait_revoked(&mut flight.epoch, generation, &mut flight.seat_epoch, &flight.seat, flight.root_epoch) => Err(ExchangeError::Revoked),
             sent = self.send(&p, &flight.secret, upstream) => sent,
         };
         let response = match sent {
             Ok(response) => response,
             Err(ExchangeError::Connect(why)) => {
-                flight.guard.finish(TicketState::Live)?;
-                self.audit_lossy(&AuditEvent::Failed {
-                    ticket: id,
-                    reason: "connect failed; nothing sent",
-                });
+                flight.guard.finish(TicketState::Live).await?;
+                self.disk(move |b| {
+                    b.audit_lossy(&AuditEvent::Failed {
+                        ticket: id,
+                        reason: "connect failed; nothing sent",
+                    })
+                })
+                .await;
                 return Err(Refusal::new(
                     Code::UpstreamFailed,
                     format!(
@@ -1041,19 +1160,25 @@ impl Broker {
             }
             Err(ExchangeError::Revoked) => {
                 let summary = cut_summary(0, ClosedBy::Revoked);
-                return Err(self.close_refused(
-                    flight,
-                    summary,
-                    Code::Revoked,
-                    "secret revoked before the stream opened",
-                ));
+                return Err(self
+                    .close_refused(
+                        flight,
+                        summary,
+                        Code::Revoked,
+                        "secret revoked before the stream opened",
+                    )
+                    .await);
             }
             Err(ExchangeError::Upstream(why)) => {
-                flight.guard.finish(TicketState::Uncertain)?;
-                self.audit_lossy(&AuditEvent::Failed {
-                    ticket: id,
-                    reason: &why,
-                });
+                flight.guard.finish(TicketState::Uncertain).await?;
+                let audit_reason = why.clone();
+                self.disk(move |b| {
+                    b.audit_lossy(&AuditEvent::Failed {
+                        ticket: id,
+                        reason: &audit_reason,
+                    })
+                })
+                .await;
                 return Err(Refusal::new(
                     Code::UpstreamFailed,
                     format!(
@@ -1067,23 +1192,24 @@ impl Broker {
         };
 
         let status = response.status().as_u16();
-        let automaton = self.inner.vault.guard();
-        if !head_is_clean(&automaton, &response) {
+        if !head_is_clean(&flight.automaton, &response) {
             drop(response);
             let summary = cut_summary(status, ClosedBy::Withheld);
-            return Err(self.close_refused(
-                flight,
-                summary,
-                Code::Withheld,
-                "the upstream reply head contained a guarded secret; stream withheld",
-            ));
+            return Err(self
+                .close_refused(
+                    flight,
+                    summary,
+                    Code::Withheld,
+                    "the upstream reply head contained a guarded secret; stream withheld",
+                )
+                .await);
         }
         let headers = caller_visible_headers(response.headers());
 
         let (items_tx, items) = mpsc::channel(STREAM_CHANNEL_DEPTH);
         tokio::spawn(
             self.clone()
-                .relay(flight, response, automaton, status, items_tx),
+                .relay(flight, response, p.prices, status, items_tx),
         );
         Ok(StreamOutcome::Live(LiveStream {
             ticket: id,
@@ -1094,7 +1220,7 @@ impl Broker {
     }
 
     /// Close a stream ticket that never produced a head, and refuse.
-    fn close_refused(
+    async fn close_refused(
         &self,
         flight: Flight,
         summary: StreamSummary,
@@ -1102,13 +1228,21 @@ impl Broker {
         message: &str,
     ) -> Refusal {
         let id = flight.guard.id;
-        if let Err(refusal) = flight.guard.finish(TicketState::Closed(summary.clone())) {
+        if let Err(refusal) = flight
+            .guard
+            .finish(TicketState::Closed(summary.clone()))
+            .await
+        {
             return refusal;
         }
-        self.audit_lossy(&AuditEvent::StreamEnd {
-            ticket: id,
-            summary: &summary,
-        });
+        let audit_summary = summary.clone();
+        self.disk(move |b| {
+            b.audit_lossy(&AuditEvent::StreamEnd {
+                ticket: id,
+                summary: &audit_summary,
+            })
+        })
+        .await;
         Refusal {
             code,
             message: message.to_owned(),
@@ -1117,31 +1251,33 @@ impl Broker {
     }
 
     /// The stream relay. One task per open stream; it parks in `select!`
-    /// on three wakers and performs no I/O other than the two sockets:
-    /// the row's epoch (revocation), the caller going away, and the next
+    /// on four wakers and performs no I/O other than the two sockets:
+    /// row and seat epochs (revocation), the caller going away, and the next
     /// upstream chunk.
     async fn relay(
         self,
         mut flight: Flight,
         mut response: reqwest::Response,
-        automaton: Arc<EchoAutomaton>,
+        prices: Option<(u64, u64)>,
         status: u16,
         items: mpsc::Sender<StreamItem>,
     ) {
         let id = flight.guard.id;
         let generation = flight.secret.generation;
-        let mut guard = EchoGuard::new(automaton);
+        let mut guard = EchoGuard::new(flight.automaton.clone());
+        let mut usage = prices.map(|_| UsageSniffer::default());
         let mut delivered = 0u64;
         let mut safe = Vec::new();
 
         let closed_by = loop {
             tokio::select! {
                 biased;
-                _ = wait_revoked(&mut flight.epoch, generation) => break ClosedBy::Revoked,
+                _ = wait_revoked(&mut flight.epoch, generation, &mut flight.seat_epoch, &flight.seat, flight.root_epoch) => break ClosedBy::Revoked,
                 _ = items.closed() => break ClosedBy::CallerDisconnect,
                 chunk = response.chunk() => {
                     let last = match chunk {
                         Ok(Some(chunk)) => {
+                            if let Some(usage) = &mut usage { usage.push(&chunk); }
                             if guard.push(&chunk, &mut safe).is_err() {
                                 break ClosedBy::Withheld;
                             }
@@ -1160,7 +1296,7 @@ impl Broker {
                         let data = Bytes::from(std::mem::take(&mut safe));
                         let sent = tokio::select! {
                             biased;
-                            _ = wait_revoked(&mut flight.epoch, generation) => Err(ClosedBy::Revoked),
+                            _ = wait_revoked(&mut flight.epoch, generation, &mut flight.seat_epoch, &flight.seat, flight.root_epoch) => Err(ClosedBy::Revoked),
                             sent = items.send(StreamItem::Chunk(data)) => sent.map_err(|_| ClosedBy::CallerDisconnect),
                         };
                         match sent {
@@ -1187,27 +1323,48 @@ impl Broker {
             revoked: closed_by == ClosedBy::Revoked,
             closed_by,
         };
-        if let Err(e) = flight.guard.finish(TicketState::Closed(summary.clone())) {
+        if let Err(e) = flight
+            .guard
+            .finish(TicketState::Closed(summary.clone()))
+            .await
+        {
             eprintln!("keygate: stream ticket {id} closed but not journaled: {e}");
         }
-        self.audit_lossy(&AuditEvent::StreamEnd {
-            ticket: id,
-            summary: &summary,
-        });
+        let actual = if summary.complete {
+            usage.and_then(|u| u.cost(prices.expect("sniffer requires prices")))
+        } else {
+            None
+        };
+        let audit_summary = summary.clone();
+        self.disk(move |b| {
+            b.settle(id, actual);
+            b.audit_lossy(&AuditEvent::StreamEnd {
+                ticket: id,
+                summary: &audit_summary,
+            });
+        })
+        .await;
         let _ = items.send(StreamItem::End(summary)).await;
     }
 }
 
-/// Resolve when the row's revocation floor passes `generation`. Pure
-/// in-memory wakeup: no timers, no disk.
-async fn wait_revoked(epoch: &mut watch::Receiver<RowEpoch>, generation: u64) {
+/// Pure in-memory notification for either revocation domain; no timers or disk.
+async fn wait_revoked(
+    epoch: &mut watch::Receiver<RowEpoch>,
+    generation: u64,
+    seats: &mut watch::Receiver<Arc<BTreeMap<String, u64>>>,
+    seat: &str,
+    root_epoch: u64,
+) {
     loop {
-        if epoch.borrow_and_update().revoked_floor > generation {
+        if epoch.borrow_and_update().revoked_floor > generation
+            || seats.borrow_and_update().get(seat).copied().unwrap_or(0) > root_epoch
+        {
             return;
         }
-        if epoch.changed().await.is_err() {
-            // The vault is gone (shutdown); nothing can revoke any more.
-            std::future::pending::<()>().await;
+        tokio::select! {
+            result = epoch.changed() => if result.is_err() { return; },
+            result = seats.changed() => if result.is_err() { return; },
         }
     }
 }
@@ -1423,6 +1580,7 @@ struct ProviderAdmission {
 struct TopLevel {
     model: Option<String>,
     output_caps: Vec<u64>,
+    n: Option<u64>,
     stream: bool,
 }
 
@@ -1448,6 +1606,7 @@ impl<'de> Deserialize<'de> for TopLevel {
                         "max_tokens" | "max_output_tokens" | "max_completion_tokens" => {
                             top.output_caps.push(map.next_value()?)
                         }
+                        "n" => top.n = Some(map.next_value()?),
                         "stream" => top.stream = map.next_value()?,
                         _ => {
                             map.next_value::<IgnoredAny>()?;
@@ -1535,18 +1694,28 @@ fn admit_provider(
             ),
         ));
     };
+    let n = top.n.unwrap_or(1);
+    if !(1..=16).contains(&n) {
+        return Err(Refusal::new(
+            Code::TokenCapRefused,
+            "n must be between 1 and 16",
+        ));
+    }
+    let cap = cap
+        .checked_mul(n)
+        .ok_or_else(|| Refusal::new(Code::TokenCapRefused, "output token cap times n overflows"))?;
     if cap > row.max_output_tokens {
         return Err(Refusal::new(
             Code::TokenCapRefused,
             format!(
-                "max_tokens {cap} exceeds provider/{name}'s limit {}",
+                "aggregate output token cap {cap} exceeds provider/{name}'s limit {}",
                 row.max_output_tokens
             ),
         ));
     }
 
     // Reservation: the output cap is exact; input is estimated at one token
-    // per three body bytes. Buffered replies settle to metered usage.
+    // per three body bytes. Complete replies settle to metered usage.
     let prices = (row.input_micro_usd_per_mtok, row.output_micro_usd_per_mtok);
     let reserve = micro_usd(body.len().div_ceil(3) as u64, cap, prices);
     if let Some(limit) = row.per_call_micro_usd {
@@ -1571,29 +1740,143 @@ fn admit_provider(
                 cap_micro_usd: row.per_seat_day_micro_usd,
             },
         ],
-        prices: (kind == CallKind::Buffered && reserve > 0).then_some(prices),
+        prices: (reserve > 0).then_some(prices),
     })
 }
 
-/// Cost from the reply's `usage` object (Anthropic or OpenAI field names).
+/// Both APIs report cumulative usage; OpenAI prompt_tokens already includes
+/// its cached tokens. Anthropic's cache counters are additional input tokens.
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(alias = "prompt_tokens")]
+    input_tokens: Option<u64>,
+    #[serde(alias = "completion_tokens")]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+impl Usage {
+    fn input(&self) -> Option<u64> {
+        Some(
+            self.input_tokens?
+                .saturating_add(self.cache_creation_input_tokens)
+                .saturating_add(self.cache_read_input_tokens),
+        )
+    }
+
+    fn cost(&self, prices: (u64, u64)) -> Option<u64> {
+        Some(micro_usd(self.input()?, self.output_tokens?, prices))
+    }
+}
+
 fn metered_cost(body: &[u8], prices: (u64, u64)) -> Option<u64> {
     #[derive(Deserialize)]
     struct Reply {
         usage: Usage,
     }
-    #[derive(Deserialize)]
-    struct Usage {
-        #[serde(alias = "prompt_tokens")]
-        input_tokens: u64,
-        #[serde(alias = "completion_tokens")]
-        output_tokens: u64,
+    serde_json::from_slice::<Reply>(body)
+        .ok()?
+        .usage
+        .cost(prices)
+}
+
+/// Bounded SSE observation only: it never rewrites or delays stream bytes.
+/// Oversized/malformed events invalidate metering, preserving the reservation.
+#[derive(Default)]
+struct UsageSniffer {
+    line: zeroize::Zeroizing<Vec<u8>>,
+    data: zeroize::Zeroizing<Vec<u8>>,
+    after_cr: bool,
+    invalid: bool,
+    input: Option<u64>,
+    output: Option<u64>,
+}
+
+impl UsageSniffer {
+    const MAX_EVENT: usize = 64 * 1024;
+
+    fn push(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.invalid {
+                return;
+            }
+            if self.after_cr && byte == b'\n' {
+                self.after_cr = false;
+                continue;
+            }
+            self.after_cr = byte == b'\r';
+            if matches!(byte, b'\r' | b'\n') {
+                self.line_end();
+            } else if self.line.len() + self.data.len() < Self::MAX_EVENT {
+                self.line.push(byte);
+            } else {
+                self.invalid = true;
+                self.line.zeroize();
+                self.data.zeroize();
+            }
+        }
     }
-    let reply: Reply = serde_json::from_slice(body).ok()?;
-    Some(micro_usd(
-        reply.usage.input_tokens,
-        reply.usage.output_tokens,
-        prices,
-    ))
+
+    fn line_end(&mut self) {
+        if self.line.is_empty() {
+            if !self.data.is_empty() {
+                self.event();
+            }
+            self.data.zeroize();
+        } else if self.line.as_slice() == b"data" || self.line.starts_with(b"data:") {
+            let value = self.line.get(5..).unwrap_or_default();
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            self.data.extend_from_slice(value);
+            self.data.push(b'\n');
+        }
+        self.line.zeroize();
+    }
+
+    fn event(&mut self) {
+        if self.data.as_slice() == b"[DONE]\n" {
+            return;
+        }
+        let Ok(event) = serde_json::from_slice::<serde_json::Value>(&self.data) else {
+            self.invalid = true;
+            return;
+        };
+        let kind = event.get("type").and_then(|v| v.as_str());
+        if kind == Some("error") || event.get("error").is_some() {
+            self.invalid = true;
+            return;
+        }
+        let usage = match kind {
+            Some("message_start") => event.get("message").and_then(|v| v.get("usage")),
+            Some("response.completed") => event.get("response").and_then(|v| v.get("usage")),
+            _ => event.get("usage"),
+        };
+        let Some(usage) = usage.filter(|v| !v.is_null()) else {
+            return;
+        };
+        let Ok(usage) = serde_json::from_value::<Usage>(usage.clone()) else {
+            self.invalid = true;
+            return;
+        };
+        if let Some(input) = usage.input() {
+            self.input = Some(self.input.unwrap_or(0).max(input));
+        }
+        // message_start's output count is provisional, not final usage.
+        if kind != Some("message_start") {
+            if let Some(output) = usage.output_tokens {
+                self.output = Some(self.output.unwrap_or(0).max(output));
+            }
+        }
+    }
+
+    fn cost(self, prices: (u64, u64)) -> Option<u64> {
+        if self.invalid || !self.line.is_empty() || !self.data.is_empty() {
+            return None;
+        }
+        Some(micro_usd(self.input?, self.output?, prices))
+    }
 }
 
 #[cfg(test)]
@@ -1649,5 +1932,268 @@ mod tests {
             Some(20)
         );
         assert_eq!(metered_cost(br#"{"error":"x"}"#, prices), None);
+    }
+
+    async fn read_request_head(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < 8192);
+            let mut byte = [0];
+            socket.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+    }
+
+    fn test_broker(origin: &str) -> (tempfile::TempDir, Broker) {
+        let dir = tempfile::tempdir().unwrap();
+        Broker::init_state(dir.path()).unwrap();
+        let cfg = Config::parse(&format!(
+            r#"
+[services.api]
+origin = "{origin}"
+buffered_paths = ["/"]
+stream_paths = ["/events"]
+"#
+        ))
+        .unwrap();
+        let broker = Broker::open(dir.path(), cfg, BrokerOptions::default()).unwrap();
+        broker
+            .set(
+                Namespace::Service,
+                "api",
+                SecretBytes::new(b"old-secret-123456".to_vec()),
+                false,
+                Caller { uid: None },
+            )
+            .unwrap();
+        (dir, broker)
+    }
+
+    /// #tooth: capture g, rotate, then exchange; the response must still be
+    /// checked against g, even though the shared guard now covers only g+1.
+    #[tokio::test]
+    async fn tooth_flight_snapshot_survives_rotation_before_buffered_exchange() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_dir, broker) = test_broker(&format!("http://{}", listener.local_addr().unwrap()));
+        let caller = Caller { uid: None };
+        let token = broker.mint("seat", None, vec![], caller).unwrap();
+        let call = Call {
+            token,
+            row: "api".into(),
+            method: "GET".into(),
+            path: "/".into(),
+            query: None,
+            headers: vec![],
+            body: vec![],
+            request_id: None,
+            last_event_id: None,
+        };
+        let (p, flight) = broker
+            .disk(move |b| {
+                let p = b
+                    .prepare(
+                        Namespace::Service,
+                        caller,
+                        call,
+                        CallKind::Buffered,
+                        HeaderMode::Strict,
+                    )
+                    .unwrap();
+                let ticket = b.open_ticket(&p).unwrap().0;
+                let flight = b.begin(&p, ticket.id).unwrap();
+                (p, flight)
+            })
+            .await;
+        broker
+            .disk(|b| {
+                b.set(
+                    Namespace::Service,
+                    "api",
+                    SecretBytes::new(b"new-secret-123456".to_vec()),
+                    false,
+                    Caller { uid: None },
+                )
+            })
+            .await
+            .unwrap();
+        let upstream = broker.inner.vault.upstream(p.ns, &p.row).unwrap();
+        assert!(!broker
+            .inner
+            .vault
+            .snapshot(upstream)
+            .unwrap()
+            .1
+            .contains(flight.secret.expose()));
+        let serve = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_head(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\nold-secret-123456").await.unwrap();
+        });
+        assert!(matches!(
+            broker
+                .buffered_exchange(&p, &flight.secret, upstream, &flight.automaton)
+                .await,
+            Err(ExchangeError::Withheld { .. })
+        ));
+        flight
+            .guard
+            .finish(TicketState::Withheld { status: 200 })
+            .await
+            .unwrap();
+        serve.await.unwrap();
+    }
+
+    /// #tooth: revocation wakes the same pending wait on either domain and
+    /// already-revoked seats are detected on the very first poll.
+    #[tokio::test]
+    async fn tooth_seat_epoch_wakes_without_io_or_timer() {
+        use std::future::Future;
+        use std::task::Poll;
+        let row = watch::Sender::new(RowEpoch {
+            generation: 1,
+            revoked_floor: 0,
+        });
+        let seats = watch::Sender::new(Arc::new(BTreeMap::new()));
+        let mut r = row.subscribe();
+        let mut s = seats.subscribe();
+        let wait = wait_revoked(&mut r, 1, &mut s, "seat", 0);
+        tokio::pin!(wait);
+        std::future::poll_fn(|cx| {
+            assert!(wait.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let start = Instant::now();
+        seats.send_replace(Arc::new(BTreeMap::from([("seat".into(), 1)])));
+        std::future::poll_fn(|cx| {
+            assert!(wait.as_mut().poll(cx).is_ready());
+            Poll::Ready(())
+        })
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_micros(100),
+            "seat notification took {elapsed:?}"
+        );
+        let mut r = row.subscribe();
+        let mut s = seats.subscribe();
+        tokio::select! {
+            biased;
+            _ = wait_revoked(&mut r, 1, &mut s, "seat", 0) => {},
+            _ = std::future::ready(()) => panic!("revoked seat could start an upstream send"),
+        }
+    }
+
+    /// #tooth: SSE parsing is chunk-independent, bounded, and requires
+    /// complete input/output usage; partial final events cannot settle.
+    #[test]
+    fn tooth_usage_sniffer_bounds_and_partial_events() {
+        let event =
+            b"data: {\"usage\":\ndata: {\"prompt_tokens\":3,\"completion_tokens\":2}}\r\n\r\n";
+        for width in 1..=event.len() {
+            let mut sniff = UsageSniffer::default();
+            for chunk in event.chunks(width) {
+                sniff.push(chunk);
+            }
+            assert_eq!(sniff.cost((1_000_000, 2_000_000)), Some(7));
+        }
+        for bad in [
+            b"data: {\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}".as_slice(),
+            b"data: {\"usage\":{\"input_tokens\":1}}\n\n",
+            b"data: {\"usage\":{\"input_tokens\":-1,\"output_tokens\":2}}\n\n",
+        ] {
+            let mut sniff = UsageSniffer::default();
+            sniff.push(bad);
+            assert_eq!(sniff.cost((1, 1)), None);
+        }
+        let mut sniff = UsageSniffer::default();
+        sniff.push(&vec![b'x'; UsageSniffer::MAX_EVENT + 1]);
+        assert!(sniff.invalid);
+        assert!(sniff.line.is_empty() && sniff.data.is_empty());
+        sniff.push(event);
+        assert_eq!(sniff.cost((1, 1)), None);
+        assert_eq!(metered_cost(br#"{"usage":{"input_tokens":1,"cache_read_input_tokens":18446744073709551615,"cache_creation_input_tokens":1,"output_tokens":0}}"#, (1_000_000, 0)), Some(u64::MAX));
+    }
+
+    /// #tooth: even a stalled disk job cannot occupy the sole async worker.
+    /// A live stream still relays bytes while durable work waits on a gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tooth_blocked_disk_work_does_not_starve_relay() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_dir, broker) = test_broker(&format!("http://{}", listener.local_addr().unwrap()));
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_head(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            receive.await.unwrap();
+            socket
+                .write_all(b"9\r\ndata: x\n\n\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let caller = Caller { uid: None };
+        let token = broker.mint("seat", None, vec![], caller).unwrap();
+        let call = Call {
+            token,
+            row: "api".into(),
+            method: "GET".into(),
+            path: "/events".into(),
+            query: None,
+            headers: vec![],
+            body: vec![],
+            request_id: None,
+            last_event_id: None,
+        };
+        let StreamOutcome::Live(mut live) = broker
+            .stream(Namespace::Service, caller, call, HeaderMode::Strict)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let (started, mut ready) = tokio::sync::mpsc::unbounded_channel();
+        let mut releases = Vec::new();
+        let mut jobs = Vec::new();
+        for _ in 0..16 {
+            let (release, gate) = std::sync::mpsc::channel();
+            releases.push(release);
+            let broker = broker.clone();
+            let started = started.clone();
+            jobs.push(tokio::spawn(async move {
+                broker
+                    .disk(move |_| {
+                        started.send(()).unwrap();
+                        // Bounded blocking waits stand in for stalled fdatasync.
+                        gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                    })
+                    .await;
+            }));
+        }
+        for _ in 0..16 {
+            ready.recv().await.unwrap();
+        }
+        assert_eq!(broker.inner.disk_slots.available_permits(), 0);
+        send.send(()).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(1), live.items.recv()).await;
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        assert!(
+            matches!(next.unwrap().unwrap(), StreamItem::Chunk(bytes) if bytes == b"data: x\n\n".as_slice())
+        );
+        for job in jobs {
+            job.await.unwrap();
+        }
+        upstream.await.unwrap();
+        assert!(
+            matches!(live.items.recv().await, Some(StreamItem::End(summary)) if summary.complete)
+        );
     }
 }

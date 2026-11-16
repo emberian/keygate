@@ -727,6 +727,15 @@ async fn tooth_dropped_exchange_future_marks_uncertain() {
         _ = rig.forward(S, request.clone()) => panic!("a hung upstream answered"),
         _ = up.arrived() => {}
     }
+    // Cancellation queues durable cleanup off the async worker. Until it
+    // completes, InFlight still prevents duplicate upstream effects.
+    tokio::time::timeout(WAIT, async {
+        while rig.broker.ticket(ticket).unwrap().state == TicketState::InFlight {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         rig.broker.ticket(ticket).unwrap().state,
         TicketState::Uncertain
@@ -1939,4 +1948,662 @@ async fn tooth_secrets_are_sealed_at_rest_and_short_ones_refused() {
         up.last().header("authorization"),
         Some(&*format!("Bearer {SECRET}"))
     );
+}
+
+/// #tooth: n cannot multiply completion output outside either cap or budget.
+#[tokio::test]
+async fn tooth_completion_count_is_capped_and_reserved() {
+    let up = counting_upstream().await;
+    let cfg = config(&up.origin).replace("per_day_micro_usd = 2500", "per_day_micro_usd = 1000");
+    let rig = Rig::new(&cfg);
+    let token = rig.token("seat-a");
+    for (n, cap) in [(0, 1), (17, 1), (100, 4096), (2, 501), (16, u64::MAX)] {
+        let body = serde_json::json!({"model":"m-small", "max_tokens":cap, "n":n}).to_string();
+        assert_eq!(
+            rig.forward(
+                P,
+                call(&token, "llm", "POST", "/v1/messages", body.as_bytes())
+            )
+            .await
+            .unwrap_err()
+            .code,
+            Code::TokenCapRefused
+        );
+    }
+    for n in ["-1", "1.5", "null", "\"2\""] {
+        let body = format!(r#"{{"model":"m-small","max_tokens":1,"n":{n}}}"#);
+        assert_eq!(
+            rig.forward(
+                P,
+                call(&token, "llm", "POST", "/v1/messages", body.as_bytes())
+            )
+            .await
+            .unwrap_err()
+            .code,
+            Code::BadRequest
+        );
+    }
+    assert_eq!(up.hits(), 0);
+    let body = br#"{"model":"m-small","max_tokens":250,"n":4}"#;
+    let request = call(&token, "llm", "POST", "/v1/messages", body);
+    let auth = rig
+        .broker
+        .authorize(P, AGENT, request.clone(), CallKind::Buffered)
+        .unwrap();
+    assert_eq!(auth.reserved_micro_usd, 1000);
+    rig.forward(P, request).await.unwrap();
+    let next = call(
+        &token,
+        "llm",
+        "POST",
+        "/v1/messages",
+        &llm("m-small", 1, false),
+    );
+    assert_eq!(
+        rig.forward(P, next).await.unwrap_err().code,
+        Code::BudgetExceeded
+    );
+    assert_eq!(up.hits(), 1);
+}
+
+/// #tooth: cached Anthropic input is charged, in buffered and SSE replies;
+/// OpenAI's final usage is recognized across arbitrary chunk boundaries.
+#[tokio::test]
+async fn tooth_cache_and_stream_usage_settle_exactly() {
+    let (senders, script) = script(2);
+    let up = Upstream::start(move |seen| {
+        if contains(&seen.body, br#""stream":true"#) { script.next() }
+        else { Reply::ok(r#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":20,"cache_read_input_tokens":300,"output_tokens":4}}"#) }
+    }).await;
+    let cfg = config(&up.origin)
+        .replace(
+            "output_micro_usd_per_mtok = 1000000",
+            "input_micro_usd_per_mtok = 1000000\noutput_micro_usd_per_mtok = 2000000",
+        )
+        .replace("per_day_micro_usd = 2500", "per_day_micro_usd = 10000");
+    let rig = Rig::new(&cfg);
+    let token = rig.token("seat-a");
+    let reply = rig
+        .forward(
+            P,
+            call(
+                &token,
+                "llm",
+                "POST",
+                "/v1/messages",
+                &llm("m-small", 1000, false),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.broker.ticket(reply.ticket).unwrap().reserved_micro_usd,
+        329
+    );
+    let fixtures = [
+        ("event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":20,\"cache_read_input_tokens\":300,\"output_tokens\":0}}}\r\n\r\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", 329),
+        ("data: {\"choices\":[],\"usage\":null}\n\ndata: {\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":10}}}\n\ndata: [DONE]\n\n", 26),
+    ];
+    for ((fixture, expected), sender) in fixtures.into_iter().zip(senders) {
+        let mut request = call(
+            &token,
+            "llm",
+            "POST",
+            "/v1/messages",
+            &llm("m-small", 1000, true),
+        );
+        request.request_id = Some(expected.to_string());
+        let mut live = rig.live(P, request.clone()).await;
+        for byte in fixture.bytes() {
+            sender.send(Bytes::from(vec![byte])).unwrap();
+        }
+        drop(sender);
+        let (delivered, summary) = drain(&mut live).await;
+        assert!(summary.complete);
+        assert_eq!(delivered, fixture.as_bytes());
+        assert_eq!(
+            rig.broker.ticket(live.ticket).unwrap().reserved_micro_usd,
+            expected
+        );
+        assert!(matches!(
+            rig.stream(P, request).await.unwrap(),
+            StreamOutcome::Spent { .. }
+        ));
+    }
+    assert_eq!(
+        rig.broker
+            .spent(&journal::row_day_key("llm", journal::utc_day(now_unix_s()))),
+        329 + 329 + 26
+    );
+}
+
+/// #tooth: partial/missing usage and abnormal endings cannot release budget.
+#[tokio::test]
+async fn tooth_stream_incomplete_or_aborted_usage_keeps_reservation() {
+    let (senders, script) = script(5);
+    let up = Upstream::start(move |_| script.next()).await;
+    let cfg = config(&up.origin).replace("per_day_micro_usd = 2500", "per_day_micro_usd = 10000");
+    let rig = Rig::new(&cfg);
+    for (i, sender) in senders.into_iter().enumerate() {
+        let token = rig.token("seat-a");
+        let mut request = call(
+            &token,
+            "llm",
+            "POST",
+            "/v1/messages",
+            &llm("m-small", 100, true),
+        );
+        request.request_id = Some(i.to_string());
+        let mut live = rig.live(P, request).await;
+        let data = match i {
+            0 => "data: {\"text\":\"no usage\"}\n\n",
+            1 => "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            _ => "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+        };
+        sender.send(Bytes::from(data)).unwrap();
+        assert_eq!(next_chunk(&mut live).await, data);
+        match i {
+            2 => {
+                rig.broker.revoke_seat("seat-a", OPERATOR).unwrap();
+                let (_, summary) = drain(&mut live).await;
+                assert!(summary.revoked);
+            }
+            3 => {
+                sender.send(Bytes::from_static(SECRET.as_bytes())).unwrap();
+                assert!(drain(&mut live).await.1.withheld);
+            }
+            4 => {
+                let id = live.ticket;
+                drop(live);
+                tokio::time::timeout(WAIT, sender.closed()).await.unwrap();
+                tokio::time::timeout(WAIT, async {
+                    while !matches!(rig.broker.ticket(id).unwrap().state, TicketState::Closed(_)) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(rig.broker.ticket(id).unwrap().reserved_micro_usd, 100);
+                continue;
+            }
+            _ => {
+                drop(sender);
+                assert!(drain(&mut live).await.1.complete);
+            }
+        }
+        assert_eq!(
+            rig.broker.ticket(live.ticket).unwrap().reserved_micro_usd,
+            100
+        );
+    }
+}
+
+/// #tooth: seat revocation cuts buffered calls, pre-head streams and idle
+/// live streams, but cannot cut another seat using the same row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tooth_seat_revocation_cuts_all_flight_phases() {
+    let (senders, script) = script(2);
+    let up = Upstream::start(move |seen| {
+        if seen.path == "/events/live" {
+            script.next()
+        } else {
+            Reply::Hang
+        }
+    })
+    .await;
+    let rig = Rig::new(&config(&up.origin));
+    let token = rig.token("seat-a");
+    let other = rig.token("seat-b");
+    let mut live = rig
+        .live(S, call(&token, "api", "GET", "/events/live", b""))
+        .await;
+    let mut survivor = rig
+        .live(S, call(&other, "api", "GET", "/events/live", b""))
+        .await;
+    // Consume arrival notifications before starting each hung exchange.
+    up.arrived().await;
+    let buffered = tokio::spawn({
+        let broker = rig.broker.clone();
+        let token = token.clone();
+        async move {
+            broker
+                .forward(
+                    S,
+                    AGENT,
+                    call(&token, "api", "POST", "/repos/hang", b"{}"),
+                    HeaderMode::Strict,
+                )
+                .await
+        }
+    });
+    up.arrived().await;
+    let prehead = tokio::spawn({
+        let broker = rig.broker.clone();
+        let token = token.clone();
+        async move {
+            broker
+                .stream(
+                    S,
+                    AGENT,
+                    call(&token, "api", "GET", "/events/hang", b""),
+                    HeaderMode::Strict,
+                )
+                .await
+        }
+    });
+    up.arrived().await;
+    rig.broker.revoke_seat("seat-a", OPERATOR).unwrap();
+    assert!(drain(&mut live).await.1.revoked);
+    assert_eq!(
+        tokio::time::timeout(WAIT, buffered)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .code,
+        Code::Revoked
+    );
+    assert_eq!(
+        tokio::time::timeout(WAIT, prehead)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .code,
+        Code::Revoked
+    );
+    senders[1].send(bytes("data: still alive\n\n")).unwrap();
+    assert_eq!(next_chunk(&mut survivor).await, "data: still alive\n\n");
+    assert_eq!(
+        rig.forward(S, call(&token, "api", "GET", "/repos/new", b""))
+            .await
+            .unwrap_err()
+            .code,
+        Code::Denied
+    );
+}
+
+/// #tooth: an audit failure is explicit after seat revocation and the
+/// revocation remains effective across restart.
+#[tokio::test]
+async fn tooth_revoke_seat_audit_failure_is_reported() {
+    let up = counting_upstream().await;
+    let rig = Rig::new(&config(&up.origin));
+    let token = rig.token("seat-a");
+    let audit = AuditLog::from_file(std::fs::File::open(rig.state().join("audit.log")).unwrap());
+    let rig = rig.reopen(BrokerOptions { audit: Some(audit) });
+    let refusal = rig.broker.revoke_seat("seat-a", OPERATOR).unwrap_err();
+    assert_eq!(refusal.code, Code::AuditFailed);
+    assert!(refusal.message.contains("IS revoked"));
+    let rig = rig.reopen(BrokerOptions::default());
+    assert_eq!(
+        rig.forward(S, call(&token, "api", "GET", "/repos", b""))
+            .await
+            .unwrap_err()
+            .code,
+        Code::Denied
+    );
+    assert_eq!(up.hits(), 0);
+}
+
+/// #tooth: rotation while waiting for a stream head cannot replace the
+/// scrubber protecting the credential already sent upstream.
+#[tokio::test]
+async fn tooth_rotation_before_stream_head_keeps_old_secret_guarded() {
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let rig = Rig::new(&config(&origin));
+    // Ensure there is no second row retaining the same old secret.
+    rig.set(P, "llm", "another-secret-98765", false);
+    let token = rig.token("seat-a");
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let gates = std::sync::Mutex::new(Some((arrived_tx, release_rx)));
+        let service = service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
+            let (arrived, release) = gates.lock().unwrap().take().unwrap();
+            async move {
+                arrived.send(()).unwrap();
+                release.await.unwrap();
+                Ok::<_, std::convert::Infallible>(
+                    hyper::Response::builder()
+                        .header("x-echo", SECRET)
+                        .body(http_body_util::Full::new(Bytes::from_static(
+                            b"data: ok\n\n",
+                        )))
+                        .unwrap(),
+                )
+            }
+        });
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(socket), service)
+            .await
+            .unwrap();
+    });
+    let exchange = tokio::spawn({
+        let broker = rig.broker.clone();
+        async move {
+            broker
+                .stream(
+                    S,
+                    AGENT,
+                    call(&token, "api", "GET", "/events", b""),
+                    HeaderMode::Strict,
+                )
+                .await
+        }
+    });
+    arrived_rx.await.unwrap();
+    rig.set(S, "api", "rotated-secret-98765", false);
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(WAIT, exchange)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .code,
+        Code::Withheld
+    );
+    server.abort();
+}
+
+/// #tooth: gateway reconnect state is forwarded or explicitly refused;
+/// bare row routes and a trailing slash both reach the upstream root.
+#[tokio::test]
+async fn tooth_gateway_root_and_last_event_id() {
+    let up = counting_upstream().await;
+    let cfg = config(&up.origin)
+        .replace("[broker]", "[broker]\nhttp_listen = \"127.0.0.1:0\"")
+        .replace("buffered_paths = [\"/repos\"]", "buffered_paths = [\"/\"]");
+    let rig = Rig::new(&cfg);
+    let token = rig.token("seat-a");
+    let listeners = Listeners::bind(&rig.broker).await.unwrap();
+    let addr = listeners.http_addr.unwrap();
+    let server = tokio::spawn(listeners.run(rig.broker.clone()));
+    for suffix in ["", "/"] {
+        let response = raw_http(addr, format!("GET /v1/service/api{suffix} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nLast-Event-ID: event-42\r\nConnection: close\r\n\r\n")).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(up.last().path, "/");
+        assert_eq!(up.last().header("last-event-id"), Some("event-42"));
+    }
+    let response = raw_http(addr, format!("POST /v1/provider/llm/v1/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nLast-Event-ID: forbidden\r\nContent-Length: 34\r\nConnection: close\r\n\r\n{{\"model\":\"m-small\",\"max_tokens\":1}}")).await;
+    assert!(response.contains("header_refused"), "{response}");
+    assert_eq!(up.hits(), 2);
+    server.abort();
+}
+
+fn framed(request: &Request) -> Vec<u8> {
+    let body = serde_json::to_vec(request).unwrap();
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// #tooth: queued frames cannot disable hangup detection for either a
+/// buffered call or an idle SSE stream; read-ahead also preserves frames.
+#[tokio::test]
+async fn tooth_unix_pipelined_hangup_and_frame_preservation() {
+    let (senders, script) = script(2);
+    let up = Upstream::start(move |seen| {
+        if seen.path == "/events" {
+            script.next()
+        } else {
+            Reply::Hang
+        }
+    })
+    .await;
+    let rig = Rig::new(&config(&up.origin));
+    let token = rig.token("seat-a");
+    let listeners = Listeners::bind(&rig.broker).await.unwrap();
+    let socket = listeners.socket_path.clone();
+    let server = tokio::spawn(listeners.run(rig.broker.clone()));
+    for kind in [CallKind::Buffered, CallKind::Stream] {
+        let (method, path) = if kind == CallKind::Buffered {
+            ("POST", "/repos/hang")
+        } else {
+            ("GET", "/events")
+        };
+        let request = call(&token, "api", method, path, b"");
+        let ticket = rig
+            .broker
+            .authorize(S, AGENT, request.clone(), kind)
+            .unwrap()
+            .ticket;
+        let wire = if kind == CallKind::Buffered {
+            Request::ServiceForward(request)
+        } else {
+            Request::ServiceStream(request)
+        };
+        let mut input = framed(&wire);
+        input.extend(framed(&Request::Hello));
+        let mut peer = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        peer.write_all(&input).await.unwrap();
+        up.arrived().await;
+        if kind == CallKind::Stream {
+            let head = keygate_broker::wire::read_frame(&mut peer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<Response>(&head).unwrap(),
+                Response::Head { .. }
+            ));
+        }
+        drop(peer);
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let state = rig.broker.ticket(ticket).unwrap().state;
+                if kind == CallKind::Buffered && state == TicketState::Uncertain {
+                    break;
+                }
+                if let TicketState::Closed(summary) = state {
+                    assert_eq!(summary.closed_by, ClosedBy::CallerDisconnect);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    tokio::time::timeout(WAIT, senders[0].closed())
+        .await
+        .unwrap();
+    // Successful streaming keeps the queued frame intact for the next dispatch.
+    let mut peer = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let mut request = call(&token, "api", "GET", "/events", b"");
+    request.request_id = Some("second-stream".into());
+    let mut input = framed(&Request::ServiceStream(request));
+    input.extend(framed(&Request::Hello));
+    peer.write_all(&input).await.unwrap();
+    let head = keygate_broker::wire::read_frame(&mut peer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_slice::<Response>(&head).unwrap(),
+        Response::Head { .. }
+    ));
+    drop(senders);
+    for expected_end in [true, false] {
+        let frame = tokio::time::timeout(WAIT, keygate_broker::wire::read_frame(&mut peer))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let response: Response = serde_json::from_slice(&frame).unwrap();
+        if expected_end {
+            assert!(matches!(response, Response::End { .. }));
+        } else {
+            assert!(matches!(response, Response::Hello { .. }));
+        }
+    }
+    server.abort();
+}
+
+/// #tooth: each transport's connection permit lasts for the entire socket
+/// lifetime and is released on disconnect, including idle connections.
+#[tokio::test]
+async fn tooth_both_transports_bound_connections() {
+    let up = counting_upstream().await;
+    let cfg = config(&up.origin).replace(
+        "[broker]",
+        "[broker]\nmax_connections = 1\nhttp_listen = \"127.0.0.1:0\"",
+    );
+    let rig = Rig::new(&cfg);
+    let token = rig.token("seat-a");
+    let listeners = Listeners::bind(&rig.broker).await.unwrap();
+    let socket = listeners.socket_path.clone();
+    let addr = listeners.http_addr.unwrap();
+    let server = tokio::spawn(listeners.run(rig.broker.clone()));
+    let mut first = Client::connect(&socket).await.unwrap();
+    assert!(matches!(
+        first.call(&Request::Hello).await.unwrap(),
+        Response::Hello { .. }
+    ));
+    let mut second = Client::connect(&socket).await.unwrap();
+    second.send(&Request::Hello).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), second.recv())
+            .await
+            .is_err()
+    );
+    drop(first);
+    assert!(matches!(
+        tokio::time::timeout(WAIT, second.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        Response::Hello { .. }
+    ));
+    let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
+    first.write_all(format!("GET /v1/service/api/repos HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n").as_bytes()).await.unwrap();
+    let mut header_byte = [0u8; 1];
+    tokio::time::timeout(WAIT, first.read_exact(&mut header_byte))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+    second.write_all(format!("GET /v1/service/api/repos HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    assert!(tokio::time::timeout(
+        Duration::from_millis(30),
+        second.read_exact(&mut header_byte)
+    )
+    .await
+    .is_err());
+    assert_eq!(up.hits(), 1);
+    drop(first);
+    let mut response = Vec::new();
+    tokio::time::timeout(WAIT, second.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(up.hits(), 2);
+    server.abort();
+}
+
+/// #tooth: admission uses the short Live TTL, while terminal reply retention
+/// remains long; connect rollback also restores the short deadline.
+#[tokio::test]
+async fn tooth_live_deadline_is_distinct_from_reply_retention() {
+    let up = counting_upstream().await;
+    let cfg = config(&up.origin).replace("retention_s = 600", "retention_s = 600\nlive_ttl_s = 7");
+    let rig = Rig::new(&cfg);
+    let token = rig.token("seat-a");
+    let request = call(&token, "api", "GET", "/repos", b"");
+    let start = now_unix_s();
+    let auth = rig
+        .broker
+        .authorize(S, AGENT, request.clone(), CallKind::Buffered)
+        .unwrap();
+    let ticket = rig.broker.ticket(auth.ticket).unwrap();
+    assert!((start + 7..=now_unix_s() + 7).contains(&ticket.expires_unix_s));
+    rig.forward(S, request).await.unwrap();
+    assert!(rig.broker.ticket(auth.ticket).unwrap().expires_unix_s >= start + 600);
+    let dead = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let rig = Rig::new(&cfg.replace(&up.origin, &format!("http://{dead}")));
+    let token = rig.token("seat-a");
+    let request = call(&token, "api", "GET", "/repos", b"");
+    assert_eq!(
+        rig.forward(S, request.clone()).await.unwrap_err().code,
+        Code::UpstreamFailed
+    );
+    let auth = rig
+        .broker
+        .authorize(S, AGENT, request, CallKind::Buffered)
+        .unwrap();
+    assert!(rig.broker.ticket(auth.ticket).unwrap().expires_unix_s <= now_unix_s() + 7);
+}
+
+/// #tooth: a transport error after a valid usage event still retains the
+/// reservation; receiving usage does not prove the stream completed.
+#[tokio::test]
+async fn tooth_upstream_error_after_usage_keeps_reservation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rig = Rig::new(&config(&format!(
+        "http://{}",
+        listener.local_addr().unwrap()
+    )));
+    let token = rig.token("seat-a");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0u8];
+        while !request.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        let text = String::from_utf8(request).unwrap();
+        let length: usize = text
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .map(str::to_owned)
+            })
+            .unwrap()
+            .parse()
+            .unwrap();
+        socket.read_exact(&mut vec![0; length]).await.unwrap();
+        let data = "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n";
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{data}\r\n",
+                    data.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        // No terminating zero chunk: an incomplete transfer.
+        socket.shutdown().await.unwrap();
+    });
+    let mut live = rig
+        .live(
+            P,
+            call(
+                &token,
+                "llm",
+                "POST",
+                "/v1/messages",
+                &llm("m-small", 100, true),
+            ),
+        )
+        .await;
+    let (_, summary) = drain(&mut live).await;
+    assert_eq!(summary.closed_by, ClosedBy::UpstreamError);
+    assert_eq!(
+        rig.broker.ticket(live.ticket).unwrap().reserved_micro_usd,
+        100
+    );
+    server.await.unwrap();
 }

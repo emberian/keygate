@@ -308,11 +308,11 @@ impl Vault {
         self.upstreams().map(Upstream::info).collect()
     }
 
-    /// The automaton over every currently active secret. A stream keeps the
-    /// `Arc` it started with, so it stays guarded against the secret it was
-    /// actually sent with even after a rotation.
-    pub fn guard(&self) -> Arc<EchoAutomaton> {
-        read(&self.guarded).automaton.clone()
+    /// Snapshot the selected secret and the guard under the same admin lock
+    /// as rotation. The flight owns both Arcs until the exchange ends.
+    pub fn snapshot(&self, upstream: &Upstream) -> Option<(Arc<ActiveSecret>, Arc<EchoAutomaton>)> {
+        let _admin = self.admin.lock().unwrap_or_else(|p| p.into_inner());
+        Some((upstream.secret()?, read(&self.guarded).automaton.clone()))
     }
 
     pub fn guarded_secrets(&self) -> usize {
@@ -400,7 +400,11 @@ impl Vault {
         if let Err(e) = self.store.write(ns, row, &tombstone) {
             // Revoked in memory regardless. Make sure the sealed secret
             // cannot come back at the next start.
-            let removed = std::fs::remove_file(self.store.path(ns, row));
+            let removed = self
+                .store
+                .path(ns, row)
+                .map_err(std::io::Error::other)
+                .and_then(std::fs::remove_file);
             return Err(Refusal::new(
                 Code::Internal,
                 format!("{ns}/{row} is revoked in memory, but writing the tombstone failed ({e}); removing the sealed file: {removed:?}"),

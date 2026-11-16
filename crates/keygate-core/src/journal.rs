@@ -14,9 +14,9 @@
 
 use crate::Namespace;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ use std::sync::Mutex;
 pub type SeatId = String;
 pub type RequestDigest32 = [u8; 32];
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TicketId(#[serde(with = "crate::hexser")] [u8; 16]);
 
 impl TicketId {
@@ -167,7 +167,7 @@ pub struct NewTicket {
     pub charges: Vec<Charge>,
     pub reserve_micro_usd: u64,
     pub now_unix_s: u64,
-    pub retention_s: u64,
+    pub live_ttl_s: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -222,11 +222,13 @@ enum Rec {
     Ledger { key: String, total: u64 },
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     tickets: HashMap<TicketId, Ticket>,
     index: HashMap<(SeatId, RequestDigest32), TicketId>,
     ledger: HashMap<String, u64>,
+    // Expiry index avoids scanning every retained reply on each admission.
+    live_expiries: BTreeSet<(u64, TicketId)>,
 }
 
 impl State {
@@ -246,6 +248,10 @@ impl State {
                 expires_unix_s,
             } => {
                 if let Some(ticket) = self.tickets.get_mut(&id) {
+                    self.live_expiries.remove(&(ticket.expires_unix_s, id));
+                    if state == TicketState::Live {
+                        self.live_expiries.insert((expires_unix_s, id));
+                    }
                     ticket.state = state;
                     ticket.expires_unix_s = expires_unix_s;
                 }
@@ -266,6 +272,7 @@ impl State {
             }
             Rec::Expire { id } => {
                 if let Some(ticket) = self.tickets.remove(&id) {
+                    self.live_expiries.remove(&(ticket.expires_unix_s, id));
                     let slot = (ticket.seat, ticket.digest);
                     if self.index.get(&slot) == Some(&id) {
                         self.index.remove(&slot);
@@ -286,6 +293,10 @@ impl State {
     }
 
     fn insert(&mut self, ticket: Ticket) {
+        if ticket.state == TicketState::Live {
+            self.live_expiries
+                .insert((ticket.expires_unix_s, ticket.id));
+        }
         self.index
             .insert((ticket.seat.clone(), ticket.digest), ticket.id);
         self.tickets.insert(ticket.id, ticket);
@@ -323,8 +334,10 @@ pub struct JournalStats {
 fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .append(true)
+        .read(true)
         .create(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
 }
 
@@ -332,12 +345,13 @@ impl Journal {
     /// Open and replay. A torn final line (crash mid-append) is cut off;
     /// damage anywhere else is an error. Tickets found `InFlight` are
     /// durably demoted to `Uncertain`.
-    pub fn open(path: &Path, compact_every: u64) -> Result<Self, JournalError> {
+    pub fn open(path: &Path, compact_every: u64, retention_s: u64) -> Result<Self, JournalError> {
         let mut state = State::default();
         let mut good_len = 0u64;
         let mut appended = 0u64;
-        if path.exists() {
-            let mut reader = BufReader::new(File::open(path)?);
+        let file = open_append(path)?;
+        {
+            let mut reader = BufReader::new(&file);
             let mut line = Vec::new();
             let mut line_no = 0usize;
             loop {
@@ -365,13 +379,11 @@ impl Journal {
                     }
                 }
             }
-            let file = OpenOptions::new().write(true).open(path)?;
             if file.metadata()?.len() != good_len {
                 file.set_len(good_len)?;
                 file.sync_all()?;
             }
         }
-        let file = open_append(path)?;
         crate::seal::sync_parent(path)?;
         let mut inner = Inner {
             path: path.to_owned(),
@@ -381,14 +393,15 @@ impl Journal {
             compact_every: compact_every.max(1),
         };
 
-        let stranded: Vec<(TicketId, u64)> = inner
+        let stranded: Vec<TicketId> = inner
             .state
             .tickets
             .values()
             .filter(|t| t.state == TicketState::InFlight)
-            .map(|t| (t.id, t.expires_unix_s))
+            .map(|t| t.id)
             .collect();
-        for (id, expires_unix_s) in stranded {
+        let expires_unix_s = crate::now_unix_s().saturating_add(retention_s);
+        for id in stranded {
             inner.commit(Rec::State {
                 id,
                 state: TicketState::Uncertain,
@@ -411,6 +424,12 @@ impl Journal {
     /// gets the same ticket back and is not charged again.
     pub fn authorize(&self, new: NewTicket) -> Result<(Ticket, bool), JournalError> {
         let mut inner = self.lock();
+        while let Some(&(expires, id)) = inner.state.live_expiries.first() {
+            if expires > new.now_unix_s {
+                break;
+            }
+            inner.commit(Rec::Expire { id })?;
+        }
         let slot = (new.seat, new.digest);
         if let Some(&id) = inner.state.index.get(&slot) {
             let ticket = &inner.state.tickets[&id];
@@ -443,7 +462,7 @@ impl Journal {
             row: new.row,
             kind: new.kind,
             state: TicketState::Live,
-            expires_unix_s: new.now_unix_s.saturating_add(new.retention_s),
+            expires_unix_s: new.now_unix_s.saturating_add(new.live_ttl_s),
             ledger_keys: if new.reserve_micro_usd > 0 {
                 new.charges.into_iter().map(|c| c.key).collect()
             } else {
@@ -539,19 +558,19 @@ impl Inner {
     }
 
     fn compact(&mut self, now_unix_s: u64) -> io::Result<()> {
-        let expired: Vec<TicketId> = self
-            .state
+        let mut snapshot = self.state.clone();
+        let expired: Vec<TicketId> = snapshot
             .tickets
             .values()
             .filter(|t| t.state != TicketState::InFlight && t.expires_unix_s <= now_unix_s)
             .map(|t| t.id)
             .collect();
         for id in expired {
-            self.state.apply(Rec::Expire { id });
+            snapshot.apply(Rec::Expire { id });
         }
         // Daily counters older than yesterday can no longer be charged.
         let today = utc_day(now_unix_s);
-        self.state.ledger.retain(|key, total| {
+        snapshot.ledger.retain(|key, total| {
             let daily = key.starts_with("rd:") || key.starts_with("sd:");
             let day = key.rsplit(':').next().and_then(|d| d.parse::<u64>().ok());
             match (daily, day) {
@@ -560,16 +579,9 @@ impl Inner {
             }
         });
 
-        let tmp = self.path.with_extension("compact");
-        let _ = fs::remove_file(&tmp);
-        let mut out = io::BufWriter::new(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?,
-        );
-        for (key, total) in &self.state.ledger {
+        let (tmp, file) = crate::seal::AtomicTemp::create(&self.path)?;
+        let mut out = io::BufWriter::new(file);
+        for (key, total) in &snapshot.ledger {
             serde_json::to_writer(
                 &mut out,
                 &Rec::Ledger {
@@ -579,23 +591,24 @@ impl Inner {
             )?;
             out.write_all(b"\n")?;
         }
-        for ticket in self.state.tickets.values() {
+        for ticket in snapshot.tickets.values() {
             serde_json::to_writer(&mut out, &Rec::Snap(ticket.clone()))?;
             out.write_all(b"\n")?;
         }
         let file = out.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
-        fs::rename(&tmp, &self.path)?;
-        crate::seal::sync_parent(&self.path)?;
-        self.file = open_append(&self.path)?;
+        tmp.install(&self.path)?;
+        self.file = file;
+        self.state = snapshot;
         self.appended = 0;
-        Ok(())
+        crate::seal::sync_parent(&self.path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     const NOW: u64 = 1_700_000_000;
 
@@ -609,7 +622,7 @@ mod tests {
             charges,
             reserve_micro_usd: reserve,
             now_unix_s: NOW,
-            retention_s: 60,
+            live_ttl_s: 60,
         }
     }
 
@@ -621,7 +634,7 @@ mod tests {
     }
 
     fn journal(dir: &Path) -> Journal {
-        Journal::open(&dir.join("journal.wal"), 1_000_000).unwrap()
+        Journal::open(&dir.join("journal.wal"), 1_000_000, 60).unwrap()
     }
 
     fn reply() -> TicketState {
@@ -752,7 +765,7 @@ mod tests {
         damaged.extend_from_slice(&intact);
         fs::write(&path, &damaged).unwrap();
         assert!(matches!(
-            Journal::open(&path, 1000),
+            Journal::open(&path, 1000, 60),
             Err(JournalError::Corrupt { line: 1, .. })
         ));
     }
@@ -790,7 +803,7 @@ mod tests {
     fn compaction_preserves_live_state_and_drops_the_expired() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let j = Journal::open(&path, 1_000_000).unwrap();
+        let j = Journal::open(&path, 1_000_000, 60).unwrap();
         let keep = j
             .authorize(new(
                 "a",
@@ -820,7 +833,7 @@ mod tests {
         assert!(fs::metadata(&path).unwrap().len() < before);
         assert_eq!(j.stats().appended_since_compaction, 0);
 
-        for j in [j, Journal::open(&path, 1_000_000).unwrap()] {
+        for j in [j, Journal::open(&path, 1_000_000, 60).unwrap()] {
             assert_eq!(j.get(keep).unwrap().state, reply());
             assert!(j.get(gone).is_none());
             assert_eq!(
@@ -837,7 +850,7 @@ mod tests {
     fn automatic_compaction_bounds_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let j = Journal::open(&path, 8).unwrap();
+        let j = Journal::open(&path, 8, 60).unwrap();
         for i in 0..50u8 {
             let mut n = new("a", i, 0, vec![]);
             n.now_unix_s = crate::now_unix_s() - 1_000; // already expired
@@ -857,5 +870,82 @@ mod tests {
             fs::metadata(dir.path().join("journal.wal")).unwrap().mode() & 0o777,
             0o600
         );
+    }
+
+    /// #tooth: a different digest can reclaim expired Live budget without
+    /// compaction; InFlight and terminal spend are never refunded.
+    #[test]
+    fn tooth_authorize_sweeps_expired_live_reservations_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = journal(dir.path());
+        let live = j.authorize(new("a", 1, 40, capped("k", 100))).unwrap().0.id;
+        let flying = j.authorize(new("a", 2, 20, capped("k", 100))).unwrap().0.id;
+        j.begin(flying).unwrap();
+        let used = j.authorize(new("a", 3, 20, capped("k", 100))).unwrap().0.id;
+        j.begin(used).unwrap();
+        j.transition(used, reply(), NOW + 1000).unwrap();
+        // Exercise expiry-index removal and reinsertion on connect rollback.
+        j.begin(live).unwrap();
+        j.transition(live, TicketState::Live, NOW + 10).unwrap();
+        let mut retry = new("b", 4, 60, capped("k", 100));
+        retry.now_unix_s = NOW + 10;
+        let fresh = j.authorize(retry).unwrap().0;
+        assert_eq!(j.spent("k"), 100);
+        assert!(j.get(live).is_none());
+        assert_eq!(j.stats().appended_since_compaction, 10);
+        drop(j);
+        let j = journal(dir.path());
+        assert!(j.get(live).is_none());
+        assert_eq!(j.spent("k"), 100);
+        assert_eq!(j.get(fresh.id).unwrap().state, TicketState::Live);
+        assert_eq!(j.get(flying).unwrap().state, TicketState::Uncertain);
+        assert_eq!(j.get(used).unwrap().state, reply());
+    }
+
+    /// #tooth: journal recovery cannot truncate a symlink target; compaction
+    /// leaves another writer's old fixed temporary name alone.
+    #[test]
+    fn tooth_journal_nofollow_and_private_compaction_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let target = dir.path().join("target");
+        fs::write(&target, b"do not truncate").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(Journal::open(&path, 100, 60).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"do not truncate");
+        fs::remove_file(&path).unwrap();
+        let fixed = path.with_extension("compact");
+        fs::write(&fixed, b"another writer").unwrap();
+        let j = journal(dir.path());
+        j.compact(NOW).unwrap();
+        assert_eq!(fs::read(&fixed).unwrap(), b"another writer");
+    }
+    /// #tooth: after a long flight crashes, the short Live TTL must not
+    /// permit immediate resend of a request whose upstream effect is unknown.
+    #[test]
+    fn tooth_crash_recovery_uses_terminal_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let old = crate::now_unix_s() - 1000;
+        let id = {
+            let j = Journal::open(&path, 1_000_000, 600).unwrap();
+            let mut n = new("seat", 1, 10, capped("k", 100));
+            n.now_unix_s = old;
+            n.live_ttl_s = 7;
+            let id = j.authorize(n).unwrap().0.id;
+            j.begin(id).unwrap();
+            id
+        };
+        let before = crate::now_unix_s();
+        let j = Journal::open(&path, 1_000_000, 600).unwrap();
+        let recovered = j.get(id).unwrap();
+        assert_eq!(recovered.state, TicketState::Uncertain);
+        assert!(recovered.expires_unix_s >= before + 600);
+        let mut retry = new("seat", 1, 10, capped("k", 100));
+        retry.now_unix_s = crate::now_unix_s();
+        let (same, existing) = j.authorize(retry).unwrap();
+        assert!(existing);
+        assert_eq!(same.id, id);
+        assert_eq!(j.spent("k"), 10);
     }
 }

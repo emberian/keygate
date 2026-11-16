@@ -26,10 +26,11 @@ use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 /// Hard ceiling on a gateway request body; rows set their own lower limits.
 const MAX_BODY_BYTES: usize = 32 << 20;
@@ -58,11 +59,18 @@ pub async fn serve(broker: Broker, listener: TcpListener) -> io::Result<()> {
             "gateway listener is not bound to loopback",
         ));
     }
+    let connections = Arc::new(Semaphore::new(broker.config().max_connections));
     loop {
+        let permit = connections
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("connection semaphore stays open");
         match listener.accept().await {
             Ok((stream, _)) => {
                 let broker = broker.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let service = service_fn(move |request| handle(broker.clone(), request));
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
@@ -100,8 +108,17 @@ async fn route(
 
     let mut headers = Vec::new();
     let mut request_id = None;
+    let last_event_id = parts
+        .headers
+        .get("last-event-id")
+        .map(|v| {
+            v.to_str()
+                .map(str::to_owned)
+                .map_err(|_| Refusal::new(Code::HeaderRefused, "invalid last-event-id"))
+        })
+        .transpose()?;
     for (name, value) in &parts.headers {
-        if name == AUTHORIZATION || name.as_str() == X_API_KEY {
+        if name == AUTHORIZATION || name.as_str() == X_API_KEY || name.as_str() == "last-event-id" {
             // The macaroon never travels upstream.
             continue;
         }
@@ -145,7 +162,7 @@ async fn route(
         headers,
         body: body.to_vec(),
         request_id,
-        last_event_id: None,
+        last_event_id,
     };
     let caller = Caller { uid: None };
 
@@ -189,8 +206,10 @@ fn split_route(path: &str) -> Result<(Namespace, &str, &str), Refusal> {
     } else {
         return Err(not_found());
     };
-    let slash = rest.find('/').ok_or_else(not_found)?;
-    let (row, upstream_path) = rest.split_at(slash);
+    let (row, upstream_path) = match rest.find('/') {
+        Some(slash) => rest.split_at(slash),
+        None => (rest, "/"),
+    };
     if !keygate_core::valid_name(row) {
         return Err(not_found());
     }
@@ -323,7 +342,6 @@ mod tests {
         );
         for bad in [
             "/",
-            "/v1/provider/anthropic",
             "/v1/pool/x/y",
             "/v2/provider/x/y",
             "/v1/provider//y",

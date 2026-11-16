@@ -5,7 +5,7 @@
 //! fails authentication, so the two tables cannot be confused on disk.
 
 use crate::secret::SecretBytes;
-use crate::Namespace;
+use crate::{valid_name, Namespace};
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use std::fs::{self, File, OpenOptions};
@@ -22,6 +22,8 @@ const MASTER_KEY_LEN: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SealError {
+    #[error("invalid row name")]
+    InvalidRow,
     #[error("io: {0}")]
     Io(#[from] io::Error),
     #[error("{path}: mode {mode:o} is accessible to group/other; expected 0600")]
@@ -56,7 +58,7 @@ impl MasterKey {
     }
 
     pub fn load(path: &Path) -> Result<Self, SealError> {
-        let mut file = File::open(path)?;
+        let mut file = open_read_nofollow(path)?;
         let mode = file.metadata()?.mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(SealError::LooseMode {
@@ -117,8 +119,9 @@ impl SealStore {
         }
     }
 
-    pub fn path(&self, ns: Namespace, row: &str) -> PathBuf {
-        self.root.join(ns.dir()).join(format!("{row}.sealed"))
+    pub fn path(&self, ns: Namespace, row: &str) -> Result<PathBuf, SealError> {
+        check_row(row)?;
+        Ok(self.root.join(ns.dir()).join(format!("{row}.sealed")))
     }
 
     fn cipher(&self) -> ChaCha20Poly1305 {
@@ -126,6 +129,7 @@ impl SealStore {
     }
 
     pub fn seal(&self, ns: Namespace, row: &str, sealed: &SealedRow) -> Result<Vec<u8>, SealError> {
+        check_row(row)?;
         let secret = sealed
             .secret
             .as_ref()
@@ -160,6 +164,7 @@ impl SealStore {
     }
 
     pub fn open(&self, ns: Namespace, row: &str, blob: &[u8]) -> Result<SealedRow, SealError> {
+        check_row(row)?;
         let malformed = || SealError::Malformed {
             ns,
             row: row.to_owned(),
@@ -201,7 +206,7 @@ impl SealStore {
     /// Seal and durably replace the row file (tmp + fsync + rename + dir fsync).
     pub fn write(&self, ns: Namespace, row: &str, sealed: &SealedRow) -> Result<(), SealError> {
         let blob = self.seal(ns, row, sealed)?;
-        let path = self.path(ns, row);
+        let path = self.path(ns, row)?;
         let dir = path.parent().expect("row path has a parent");
         fs::create_dir_all(dir)?;
         write_atomic(&path, &blob)?;
@@ -209,26 +214,85 @@ impl SealStore {
     }
 
     pub fn read(&self, ns: Namespace, row: &str) -> Result<Option<SealedRow>, SealError> {
-        match fs::read(self.path(ns, row)) {
-            Ok(blob) => self.open(ns, row, &blob).map(Some),
+        match open_read_nofollow(&self.path(ns, row)?) {
+            Ok(mut file) => {
+                let mut blob = Vec::new();
+                file.read_to_end(&mut blob)?;
+                self.open(ns, row, &blob).map(Some)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 }
 
+fn check_row(row: &str) -> Result<(), SealError> {
+    if valid_name(row) {
+        Ok(())
+    } else {
+        Err(SealError::InvalidRow)
+    }
+}
+
+pub(crate) fn open_read_nofollow(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// A privately owned temporary name in the destination's directory. Never
+/// unlink another writer's temporary file, including after a collision.
+pub(crate) struct AtomicTemp {
+    path: Option<PathBuf>,
+}
+
+impl AtomicTemp {
+    pub(crate) fn create(destination: &Path) -> io::Result<(Self, File)> {
+        loop {
+            let mut nonce = [0u8; 8];
+            crate::random_bytes(&mut nonce)?;
+            let mut name = destination.as_os_str().to_owned();
+            name.push(format!(".tmp.{}", hex::encode(nonce)));
+            let path = PathBuf::from(name);
+            match OpenOptions::new()
+                .append(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+            {
+                Ok(file) => return Ok((Self { path: Some(path) }, file)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub(crate) fn install(mut self, destination: &Path) -> io::Result<()> {
+        fs::rename(
+            self.path.as_ref().expect("temporary name owned"),
+            destination,
+        )?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for AtomicTemp {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Durable whole-file replace with mode `0600`.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    let _ = fs::remove_file(&tmp);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let (tmp, mut file) = AtomicTemp::create(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(&tmp, path)?;
+    tmp.install(path)?;
     sync_parent(path)
 }
 
@@ -340,5 +404,81 @@ mod tests {
             MasterKey::load(&path),
             Err(SealError::LooseMode { .. })
         ));
+    }
+
+    /// #tooth: custody reads never follow a substituted final-component symlink.
+    #[test]
+    fn tooth_nofollow_and_invalid_row_names() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let master = dir.path().join("master.key");
+        MasterKey::generate(&master).unwrap();
+        let link = dir.path().join("link");
+        symlink(&master, &link).unwrap();
+        assert!(MasterKey::load(&link).is_err());
+        let s = store(dir.path());
+        s.write(Namespace::Service, "good", &row(b"secret-0123456789"))
+            .unwrap();
+        symlink(
+            s.path(Namespace::Service, "good").unwrap(),
+            s.path(Namespace::Service, "link").unwrap(),
+        )
+        .unwrap();
+        assert!(s.read(Namespace::Service, "link").is_err());
+        for bad in ["", "/tmp/escape", "../escape", "a/b", ".", ".."] {
+            assert!(s.path(Namespace::Service, bad).is_err());
+            assert!(s
+                .seal(Namespace::Service, bad, &row(b"secret-0123456789"))
+                .is_err());
+            assert!(s.open(Namespace::Service, bad, b"").is_err());
+            assert!(s
+                .write(Namespace::Service, bad, &row(b"secret-0123456789"))
+                .is_err());
+            assert!(s.read(Namespace::Service, bad).is_err());
+        }
+    }
+
+    /// #tooth: competing atomic writers each own a distinct 0600 temporary.
+    #[test]
+    fn tooth_atomic_writers_do_not_unlink_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("row.sealed");
+        let fixed = dest.with_extension("tmp");
+        fs::write(&fixed, b"owned by someone else").unwrap();
+        let (a, fa) = AtomicTemp::create(&dest).unwrap();
+        let (b, fb) = AtomicTemp::create(&dest).unwrap();
+        assert_ne!(a.path, b.path);
+        for (tmp, file) in [(&a, &fa), (&b, &fb)] {
+            let name = tmp
+                .path
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let suffix = name.strip_prefix("row.sealed.tmp.").unwrap();
+            assert_eq!(suffix.len(), 16);
+            assert!(suffix.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        }
+        drop(a);
+        assert!(b.path.as_ref().unwrap().exists());
+        drop(b);
+        std::thread::scope(|scope| {
+            for byte in 0..16u8 {
+                let dest = &dest;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        write_atomic(dest, &vec![byte; 4096]).unwrap();
+                    }
+                });
+            }
+        });
+        let data = fs::read(&dest).unwrap();
+        assert_eq!(data.len(), 4096);
+        assert!(data.iter().all(|b| *b == data[0]));
+        assert_eq!(fs::read(&fixed).unwrap(), b"owned by someone else");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 }

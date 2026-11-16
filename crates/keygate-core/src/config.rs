@@ -49,7 +49,11 @@ pub struct BrokerCfg {
     /// Uids allowed to mint, set, revoke and list. Empty means the owner of
     /// the state directory.
     pub operator_uids: Vec<u32>,
-    /// How long tickets (and retained buffered replies) stay replayable.
+    /// Maximum accepted connections per transport.
+    pub max_connections: usize,
+    /// How long unused reservations remain Live.
+    pub live_ttl_s: u64,
+    /// How long terminal tickets (and retained buffered replies) stay replayable.
     pub retention_s: u64,
     /// Rewrite the journal after this many appended records.
     pub compact_every: u64,
@@ -67,6 +71,8 @@ impl Default for BrokerCfg {
             socket_mode: 0o600,
             http_listen: None,
             operator_uids: Vec::new(),
+            max_connections: 256,
+            live_ttl_s: 120,
             retention_s: 900,
             compact_every: 1024,
             max_response_bytes: 16 << 20,
@@ -338,9 +344,14 @@ impl Config {
                 )));
             }
         }
-        if self.broker.retention_s == 0 || self.broker.compact_every == 0 {
+        if self.broker.retention_s == 0
+            || self.broker.live_ttl_s == 0
+            || self.broker.compact_every == 0
+            || self.broker.max_connections == 0
+            || self.broker.max_connections > 1_000_000
+        {
             return Err(ConfigError::Broker(
-                "retention_s and compact_every must be positive".to_owned(),
+                "retention_s, live_ttl_s and compact_every must be positive; max_connections must be 1..=1000000".to_owned(),
             ));
         }
         if self.broker.socket_mode & !0o777 != 0 {
@@ -521,6 +532,21 @@ mod tests {
         ];
         for text in cases {
             assert!(Config::parse(&text).is_err(), "should refuse:\n{text}");
+        }
+    }
+
+    /// #tooth: connection admission and Live expiry must have finite bounds.
+    #[test]
+    fn tooth_broker_resource_defaults_and_bounds() {
+        let cfg = Config::parse(SERVICE).unwrap();
+        assert_eq!(cfg.broker.max_connections, 256);
+        assert_eq!(cfg.broker.live_ttl_s, 120);
+        for field in [
+            "max_connections = 0",
+            "max_connections = 1000001",
+            "live_ttl_s = 0",
+        ] {
+            assert!(Config::parse(&format!("[broker]\n{field}\n{SERVICE}")).is_err());
         }
     }
 }

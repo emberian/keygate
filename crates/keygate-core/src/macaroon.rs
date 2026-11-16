@@ -16,6 +16,7 @@ use crate::path::PlainPath;
 use crate::Namespace;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 pub const TOKEN_PREFIX: &str = "kgm_";
 const VERSION: u8 = 1;
@@ -148,7 +149,7 @@ impl MacaroonV1 {
     }
 
     pub fn encode(&self) -> String {
-        let mut w = Vec::with_capacity(128);
+        let mut w = Zeroizing::new(Vec::with_capacity(128));
         w.push(VERSION);
         w.extend_from_slice(&encode_root(&self.root));
         put_u32(&mut w, self.caveats.len() as u32);
@@ -158,7 +159,7 @@ impl MacaroonV1 {
             put_bytes(&mut w, &enc);
         }
         w.extend_from_slice(&self.tag);
-        format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(w))
+        format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(&*w))
     }
 
     pub fn decode(token: &str) -> Result<Self, MacaroonError> {
@@ -168,9 +169,11 @@ impl MacaroonV1 {
         if body.len() > MAX_TOKEN_LEN {
             return Err(MacaroonError::Malformed("too long"));
         }
-        let raw = URL_SAFE_NO_PAD
-            .decode(body)
-            .map_err(|_| MacaroonError::Malformed("not base64url"))?;
+        let raw = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(body)
+                .map_err(|_| MacaroonError::Malformed("not base64url"))?,
+        );
         let mut r = Reader(&raw);
         if r.u8()? != VERSION {
             return Err(MacaroonError::Malformed("unknown version"));
@@ -199,18 +202,18 @@ impl MacaroonV1 {
 
     /// Recompute the chain under `root_key` and compare in constant time.
     pub fn verify(&self, root_key: &[u8; 32]) -> Result<Verified, MacaroonError> {
-        let mut tag = mac(root_key, ROOT_DOMAIN, &encode_root(&self.root));
+        let mut tag = Zeroizing::new(mac(root_key, ROOT_DOMAIN, &encode_root(&self.root)));
         let mut spend_scopes = Vec::new();
         for caveat in &self.caveats {
-            tag = mac(&tag, CAVEAT_DOMAIN, &encode_caveat(caveat)?);
+            *tag = mac(&tag, CAVEAT_DOMAIN, &encode_caveat(caveat)?);
             if let Caveat::MaxSpendMicroUsd(cap) = caveat {
                 spend_scopes.push(SpendScope {
-                    id: blake3::derive_key(SCOPE_CONTEXT, &tag),
+                    id: blake3::derive_key(SCOPE_CONTEXT, &*tag),
                     cap_micro_usd: *cap,
                 });
             }
         }
-        if blake3::Hash::from(tag) != blake3::Hash::from(self.tag) {
+        if blake3::Hash::from(*tag) != blake3::Hash::from(self.tag) {
             return Err(MacaroonError::BadSignature);
         }
         Ok(Verified {
@@ -218,6 +221,18 @@ impl MacaroonV1 {
             caveats: self.caveats.clone(),
             spend_scopes,
         })
+    }
+}
+
+impl Zeroize for MacaroonV1 {
+    fn zeroize(&mut self) {
+        self.tag.zeroize();
+    }
+}
+
+impl Drop for MacaroonV1 {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
@@ -301,8 +316,10 @@ fn put_bytes(w: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn put_list(w: &mut Vec<u8>, items: &[String]) -> Result<(), MacaroonError> {
-    if items.len() > MAX_LIST {
-        return Err(MacaroonError::Malformed("list too long"));
+    if items.is_empty() || items.len() > MAX_LIST {
+        return Err(MacaroonError::Malformed(
+            "list must be nonempty and within the limit",
+        ));
     }
     put_u32(w, items.len() as u32);
     for item in items {
@@ -406,6 +423,9 @@ fn encode_caveat(caveat: &Caveat) -> Result<Vec<u8>, MacaroonError> {
     let mut w = Vec::with_capacity(32);
     match caveat {
         Caveat::Seat(seat) => {
+            if !crate::valid_name(seat) {
+                return Err(MacaroonError::Malformed("invalid seat"));
+            }
             w.push(1);
             put_str(&mut w, seat)?;
         }
@@ -417,14 +437,28 @@ fn encode_caveat(caveat: &Caveat) -> Result<Vec<u8>, MacaroonError> {
             });
         }
         Caveat::Rows(items) => {
+            if items.iter().any(|r| !crate::valid_name(r)) {
+                return Err(MacaroonError::Malformed("invalid row"));
+            }
             w.push(3);
             put_list(&mut w, items)?;
         }
         Caveat::Methods(items) => {
+            if items.iter().any(|m| {
+                !matches!(
+                    m.as_str(),
+                    "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE"
+                )
+            }) {
+                return Err(MacaroonError::Malformed("unsupported method"));
+            }
             w.push(4);
             put_list(&mut w, items)?;
         }
         Caveat::PathPrefixes(items) => {
+            if items.iter().any(|p| PlainPath::parse(p).is_err()) {
+                return Err(MacaroonError::Malformed("invalid plain path"));
+            }
             w.push(5);
             put_list(&mut w, items)?;
         }
@@ -750,5 +784,41 @@ mod tests {
     fn debug_redacts_tag() {
         let m = build(vec![]);
         assert!(format!("{m:?}").contains("<redacted>"));
+    }
+
+    /// #tooth: unusable restrictions fail at attenuation, not first use.
+    #[test]
+    fn tooth_invalid_caveats_fail_eagerly() {
+        let bad = vec![
+            Caveat::Seat("../seat".into()),
+            Caveat::Seat("".into()),
+            Caveat::Rows(vec!["ok".into(), "a/b".into()]),
+            Caveat::Rows(vec![]),
+            Caveat::Methods(vec!["get".into()]),
+            Caveat::Methods(vec!["CONNECT".into()]),
+            Caveat::Methods(vec!["BOGUS".into()]),
+            Caveat::Methods(vec![]),
+            Caveat::PathPrefixes(vec!["/ok".into(), "/a/../b".into()]),
+            Caveat::PathPrefixes(vec!["/%2e".into()]),
+            Caveat::PathPrefixes(vec![]),
+        ];
+        for caveat in bad {
+            assert!(
+                MacaroonV1::mint(&KEY, root())
+                    .attenuate(caveat.clone())
+                    .is_err(),
+                "{caveat:?}"
+            );
+        }
+        assert!(MacaroonV1::mint(&KEY, root())
+            .attenuate(Caveat::PathPrefixes(vec!["/".into()]))
+            .is_ok());
+        // Exercise the wiping implementation used by Drop without reading
+        // freed storage. Verify that the type needs destruction too.
+        let mut token = build(all_caveats());
+        assert_ne!(token.tag, [0; 32]);
+        assert!(std::mem::needs_drop::<MacaroonV1>());
+        token.zeroize();
+        assert_eq!(token.tag, [0; 32]);
     }
 }

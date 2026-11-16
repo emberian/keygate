@@ -1,6 +1,6 @@
 //! `plain_path`: the only path shape keygate will sign off on.
 //!
-//! A plain path is `/seg/seg/...` where every segment is non-empty, is not
+//! A plain path is `/` (zero segments) or `/seg/seg/...` where every segment is non-empty, is not
 //! `.` or `..`, and uses a fixed unreserved alphabet. There is no
 //! percent-encoding, so there is exactly one spelling of every path and no
 //! proxy or router between keygate and the origin can normalize it into a
@@ -50,7 +50,7 @@ impl PlainPath {
         let Some(rest) = raw.strip_prefix('/') else {
             return Err(PathError::NotAbsolute);
         };
-        for segment in rest.split('/') {
+        for segment in rest.split('/').filter(|_| !rest.is_empty()) {
             if segment.is_empty() {
                 return Err(PathError::EmptySegment);
             }
@@ -79,7 +79,7 @@ impl PlainPath {
     }
 
     pub fn segments(&self) -> impl Iterator<Item = &str> {
-        self.0[1..].split('/')
+        self.0[1..].split('/').filter(|_| self.0.len() > 1)
     }
 
     /// Segment-wise prefix: `/repos` covers `/repos` and `/repos/x`, never
@@ -128,7 +128,7 @@ mod tests {
         let cases: &[(&str, PathError)] = &[
             ("v1/messages", PathError::NotAbsolute),
             ("", PathError::NotAbsolute),
-            ("/", PathError::EmptySegment),
+            ("//", PathError::EmptySegment),
             ("/v1//messages", PathError::EmptySegment),
             ("/v1/messages/", PathError::EmptySegment),
             ("/v1/./messages", PathError::DotSegment),
@@ -156,6 +156,7 @@ mod tests {
     #[test]
     fn accepts_plain_paths() {
         for raw in [
+            "/",
             "/v1/messages",
             "/repos/o/r/issues",
             "/v1beta/models/gemini-pro:generateContent",
@@ -168,6 +169,9 @@ mod tests {
     #[test]
     fn prefix_is_segment_wise() {
         let p = |s| PlainPath::parse(s).unwrap();
+        assert_eq!(p("/").segments().count(), 0);
+        assert!(p("/repos").starts_with(&p("/")));
+        assert!(!p("/").starts_with(&p("/repos")));
         assert!(p("/repos/o/r").starts_with(&p("/repos")));
         assert!(p("/repos").starts_with(&p("/repos")));
         assert!(!p("/reposx").starts_with(&p("/repos")));

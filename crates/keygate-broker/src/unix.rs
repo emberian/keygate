@@ -13,9 +13,11 @@ use std::future::Future;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use zeroize::Zeroize;
 
 /// Bind the broker socket with `mode`. A leftover socket file from a dead
@@ -46,11 +48,18 @@ pub fn bind(path: &Path, mode: u32) -> io::Result<UnixListener> {
 }
 
 pub async fn serve(broker: Broker, listener: UnixListener) -> io::Result<()> {
+    let connections = Arc::new(Semaphore::new(broker.config().max_connections));
     loop {
+        let permit = connections
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("connection semaphore stays open");
         match listener.accept().await {
             Ok((stream, _)) => {
                 let broker = broker.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     // A connection error only ever concerns that one peer.
                     let _ = connection(broker, stream).await;
                 });
@@ -68,11 +77,32 @@ async fn connection(broker: Broker, stream: UnixStream) -> io::Result<()> {
     let uid = stream.peer_cred()?.uid();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    while let Some(mut frame) = read_frame(&mut reader).await? {
+    let mut pending = zeroize::Zeroizing::new(Vec::new());
+    loop {
+        let mut queued =
+            std::io::Cursor::new(zeroize::Zeroizing::new(std::mem::take(&mut *pending)));
+        let frame = read_frame(&mut (&mut queued).chain(&mut reader)).await?;
+        let consumed = queued.position() as usize;
+        pending = queued.into_inner();
+        pending[..consumed].zeroize();
+        pending.drain(..consumed);
+        let Some(mut frame) = frame else {
+            break;
+        };
         let request = serde_json::from_slice::<Request>(&frame);
         frame.zeroize();
         let keep_open = match request {
-            Ok(request) => dispatch(&broker, uid, request, &mut reader, &mut writer).await?,
+            Ok(request) => {
+                dispatch(
+                    &broker,
+                    uid,
+                    request,
+                    &mut reader,
+                    &mut pending,
+                    &mut writer,
+                )
+                .await?
+            }
             Err(e) => {
                 write_frame(
                     &mut writer,
@@ -95,21 +125,35 @@ async fn connection(broker: Broker, stream: UnixStream) -> io::Result<()> {
 /// Run `work` unless the peer hangs up first. Returning `None` drops the
 /// future, which is what turns an in-flight buffered call `Uncertain` and
 /// aborts its upstream request.
-async fn until_hangup<R, F>(reader: &mut R, work: F) -> Option<F::Output>
+async fn until_hangup<R, F>(reader: &mut R, pending: &mut Vec<u8>, work: F) -> Option<F::Output>
 where
     R: AsyncBufRead + Unpin,
     F: Future,
 {
-    tokio::pin!(work);
     tokio::select! {
-        output = &mut work => return Some(output),
-        buffered = reader.fill_buf() => match buffered {
-            // The peer pipelined its next frame; it is still there.
-            Ok(bytes) if !bytes.is_empty() => {}
-            _ => return None,
-        },
+        biased;
+        _ = watch_hangup(reader, pending) => None,
+        output = work => Some(output),
     }
-    Some(work.await)
+}
+
+/// Drain pipelined input into bounded read-ahead so buffered bytes cannot
+/// mask EOF. Excess pipelining closes the connection instead of growing
+/// memory indefinitely. All reads are readiness driven.
+async fn watch_hangup<R: AsyncBufRead + Unpin>(reader: &mut R, pending: &mut Vec<u8>) {
+    loop {
+        let Ok(bytes) = reader.fill_buf().await else {
+            return;
+        };
+        if bytes.is_empty()
+            || pending.len() + bytes.len() > keygate_core::proto::MAX_FRAME_BYTES + 4
+        {
+            return;
+        }
+        pending.extend_from_slice(bytes);
+        let n = bytes.len();
+        reader.consume(n);
+    }
 }
 
 /// Handle one request. `Ok(false)` means the peer is gone.
@@ -118,6 +162,7 @@ async fn dispatch<R, W>(
     uid: u32,
     request: Request,
     reader: &mut R,
+    pending: &mut Vec<u8>,
     writer: &mut W,
 ) -> io::Result<bool>
 where
@@ -154,7 +199,14 @@ where
             allowed_uid,
             caveats,
         } => {
-            let minted = operator().and_then(|()| broker.mint(&seat, allowed_uid, caveats, caller));
+            let minted = match operator() {
+                Ok(()) => {
+                    broker
+                        .disk(move |b| b.mint(&seat, allowed_uid, caveats, caller))
+                        .await
+                }
+                Err(e) => Err(e),
+            };
             write_frame(
                 writer,
                 &answer(minted.map(|token| Response::Token { token })),
@@ -178,21 +230,33 @@ where
         } => {
             let decoded = STANDARD.decode(secret_b64.as_bytes()).map(SecretBytes::new);
             secret_b64.zeroize();
-            let done = operator().and_then(|()| {
-                let secret = decoded
-                    .map_err(|_| Refusal::new(Code::BadRequest, "secret_b64 is not base64"))?;
-                broker.set(namespace, &row, secret, cut_existing, caller)
-            });
+            let allowed = operator();
+            let done = broker
+                .disk(move |broker| {
+                    allowed.and_then(|()| {
+                        let secret = decoded.map_err(|_| {
+                            Refusal::new(Code::BadRequest, "secret_b64 is not base64")
+                        })?;
+                        broker.set(namespace, &row, secret, cut_existing, caller)
+                    })
+                })
+                .await;
             write_frame(writer, &answer(done.map(|_| Response::Ok))).await?;
             return Ok(true);
         }
         Request::Revoke { namespace, row } => {
-            let done = operator().and_then(|()| broker.revoke(namespace, &row, caller));
+            let allowed = operator();
+            let done = broker
+                .disk(move |b| allowed.and_then(|()| b.revoke(namespace, &row, caller)))
+                .await;
             write_frame(writer, &answer(done.map(|_| Response::Ok))).await?;
             return Ok(true);
         }
         Request::RevokeSeat { seat } => {
-            let done = operator().and_then(|()| broker.revoke_seat(&seat, caller));
+            let allowed = operator();
+            let done = broker
+                .disk(move |b| allowed.and_then(|()| b.revoke_seat(&seat, caller)))
+                .await;
             write_frame(writer, &answer(done.map(|_| Response::Ok))).await?;
             return Ok(true);
         }
@@ -207,9 +271,10 @@ where
             return Ok(true);
         }
         Request::Status => {
+            let status = broker.disk(|b| b.status()).await;
             write_frame(
                 writer,
-                &answer(operator().map(|()| Response::Status(broker.status()))),
+                &answer(operator().map(|()| Response::Status(status))),
             )
             .await?;
             return Ok(true);
@@ -234,7 +299,8 @@ where
 
     if !send {
         let authorized = broker
-            .authorize(ns, caller, call, kind)
+            .disk(move |b| b.authorize(ns, caller, call, kind))
+            .await
             .map(|a| Response::Authorized {
                 ticket: a.ticket,
                 state: a.state.to_owned(),
@@ -247,8 +313,12 @@ where
 
     match kind {
         CallKind::Buffered => {
-            let Some(result) =
-                until_hangup(reader, broker.forward(ns, caller, call, HeaderMode::Strict)).await
+            let Some(result) = until_hangup(
+                reader,
+                pending,
+                broker.forward(ns, caller, call, HeaderMode::Strict),
+            )
+            .await
             else {
                 return Ok(false);
             };
@@ -262,8 +332,12 @@ where
             write_frame(writer, &answer(reply)).await?;
         }
         CallKind::Stream => {
-            let Some(result) =
-                until_hangup(reader, broker.stream(ns, caller, call, HeaderMode::Strict)).await
+            let Some(result) = until_hangup(
+                reader,
+                pending,
+                broker.stream(ns, caller, call, HeaderMode::Strict),
+            )
+            .await
             else {
                 return Ok(false);
             };
@@ -286,34 +360,46 @@ where
                     return Ok(true);
                 }
             };
-            let ticket = live.ticket;
-            write_frame(
-                writer,
-                &Response::Head {
-                    ticket,
-                    status: live.status,
-                    headers: std::mem::take(&mut live.headers),
-                },
-            )
-            .await?;
-            let mut watch_peer = true;
-            loop {
-                // Returning early drops `live`, which aborts the upstream.
-                tokio::select! {
-                    item = live.items.recv() => match item {
-                        Some(StreamItem::Chunk(data)) => write_frame(writer, &Response::Chunk { data: data.to_vec() }).await?,
-                        Some(StreamItem::End(summary)) => {
-                            write_frame(writer, &Response::End { ticket, summary, spent: false }).await?;
-                            break;
+            let completed = until_hangup(reader, pending, async {
+                let ticket = live.ticket;
+                write_frame(
+                    writer,
+                    &Response::Head {
+                        ticket,
+                        status: live.status,
+                        headers: std::mem::take(&mut live.headers),
+                    },
+                )
+                .await?;
+                while let Some(item) = live.items.recv().await {
+                    match item {
+                        StreamItem::Chunk(data) => {
+                            write_frame(
+                                writer,
+                                &Response::Chunk {
+                                    data: data.to_vec(),
+                                },
+                            )
+                            .await?
                         }
-                        None => return Ok(false),
-                    },
-                    buffered = reader.fill_buf(), if watch_peer => match buffered {
-                        Ok(bytes) if !bytes.is_empty() => watch_peer = false,
-                        _ => return Ok(false),
-                    },
+                        StreamItem::End(summary) => {
+                            write_frame(
+                                writer,
+                                &Response::End {
+                                    ticket,
+                                    summary,
+                                    spent: false,
+                                },
+                            )
+                            .await?;
+                            return Ok::<_, io::Error>(true);
+                        }
+                    }
                 }
-            }
+                Ok(false)
+            })
+            .await;
+            return completed.unwrap_or(Ok(false));
         }
     }
     Ok(true)

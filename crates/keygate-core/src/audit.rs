@@ -74,6 +74,7 @@ impl AuditLog {
             .append(true)
             .create(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         let mode = file.metadata()?.mode() & 0o777;
         if mode & 0o077 != 0 {
@@ -178,5 +179,17 @@ mod tests {
         drop(AuditLog::open(&path).unwrap());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         assert!(AuditLog::open(&path).is_err());
+    }
+
+    /// #tooth: opening an audit symlink cannot append into its target.
+    #[test]
+    fn tooth_audit_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        drop(AuditLog::open(&target).unwrap());
+        let link = dir.path().join("audit.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(AuditLog::open(&link).is_err());
+        assert!(std::fs::read(&target).unwrap().is_empty());
     }
 }
