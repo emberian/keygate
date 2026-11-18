@@ -20,8 +20,8 @@ use keygate_core::audit::{AuditEvent, AuditFaults, AuditLog};
 use keygate_core::config::{header_is_reserved, BrokerCfg, Config, Deployment};
 use keygate_core::echo::{EchoAutomaton, EchoGuard};
 use keygate_core::journal::{
-    self, Begin, CallKind, Charge, ClosedBy, Journal, JournalError, JournalFaults, NewTicket,
-    RequestDigest32, Retained, StreamSummary, Ticket, TicketId, TicketState,
+    self, Begin, CallKind, Charge, ClosedBy, ErrorClass, Journal, JournalError, JournalFaults,
+    NewTicket, RequestDigest32, Retained, StreamSummary, Ticket, TicketId, TicketState,
 };
 use keygate_core::macaroon::{self, Caveat, Facts, MacaroonV1, RootId, Verified, TOKEN_PREFIX};
 use keygate_core::path::{check_query, PlainPath};
@@ -325,6 +325,7 @@ impl Drop for FlightGuard {
                 broker.audit_lossy(&AuditEvent::Failed {
                     ticket: id,
                     reason: "abandoned mid-flight; marked uncertain",
+                    error_class: None,
                 });
             };
             // Cancellation must never block a relay worker. Until this durable
@@ -342,8 +343,9 @@ impl Drop for FlightGuard {
 
 enum ExchangeError {
     /// The TCP/TLS connection was never established: nothing was sent.
-    Connect(String),
-    Upstream(String),
+    /// The class is absent when the request failed before any I/O.
+    Connect(String, Option<ErrorClass>),
+    Upstream(String, ErrorClass),
     TooLarge,
     Withheld {
         status: u16,
@@ -1238,8 +1240,9 @@ impl Broker {
         value.extend_from_slice(secret.expose());
         let auth = HeaderValue::from_bytes(&value);
         value.zeroize();
-        let mut auth = auth
-            .map_err(|_| ExchangeError::Connect("secret is not a valid header value".to_owned()))?;
+        let mut auth = auth.map_err(|_| {
+            ExchangeError::Connect("secret is not a valid header value".to_owned(), None)
+        })?;
         auth.set_sensitive(true);
         headers.insert(upstream.auth_header.clone(), auth);
         // EchoGuard scans plaintext; a compressed echo would slip past it.
@@ -1257,10 +1260,11 @@ impl Broker {
             request = request.timeout(Duration::from_millis(self.inner.cfg.buffered_timeout_ms));
         }
         request.send().await.map_err(|e| {
+            let class = classify(&e);
             if e.is_connect() {
-                ExchangeError::Connect(e.without_url().to_string())
+                ExchangeError::Connect(e.without_url().to_string(), Some(class))
             } else {
-                ExchangeError::Upstream(e.without_url().to_string())
+                ExchangeError::Upstream(e.without_url().to_string(), class)
             }
         })
     }
@@ -1352,12 +1356,13 @@ impl Broker {
                 .await;
                 Ok(reply)
             }
-            Err(ExchangeError::Connect(why)) => {
+            Err(ExchangeError::Connect(why, error_class)) => {
                 flight.guard.finish(TicketState::Live).await?;
                 self.disk(move |b| {
                     b.audit_lossy(&AuditEvent::Failed {
                         ticket: id,
                         reason: "connect failed; nothing sent",
+                        error_class,
                     })
                 })
                 .await;
@@ -1385,17 +1390,18 @@ impl Broker {
                 Err(withheld_refusal())
             }
             Err(failure) => {
-                let (code, reason) = match failure {
-                    ExchangeError::Cut(cut) => (cut.code(), cut.reason().to_owned()),
+                let (code, reason, error_class) = match failure {
+                    ExchangeError::Cut(cut) => (cut.code(), cut.reason().to_owned(), None),
                     ExchangeError::TooLarge => (
                         Code::TooLarge,
                         format!(
                             "upstream reply exceeds {} bytes",
                             self.inner.cfg.max_response_bytes
                         ),
+                        None,
                     ),
-                    ExchangeError::Upstream(why) => (Code::UpstreamFailed, why),
-                    ExchangeError::Connect(_) | ExchangeError::Withheld { .. } => {
+                    ExchangeError::Upstream(why, class) => (Code::UpstreamFailed, why, Some(class)),
+                    ExchangeError::Connect(..) | ExchangeError::Withheld { .. } => {
                         unreachable!("handled above")
                     }
                 };
@@ -1405,6 +1411,7 @@ impl Broker {
                     b.audit_lossy(&AuditEvent::Failed {
                         ticket: id,
                         reason: &audit_reason,
+                        error_class,
                     })
                 })
                 .await;
@@ -1432,11 +1439,10 @@ impl Broker {
         }
         let headers = caller_visible_headers(response.headers());
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| ExchangeError::Upstream(e.without_url().to_string()))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            let class = classify(&e);
+            ExchangeError::Upstream(e.without_url().to_string(), class)
+        })? {
             if body.len() + chunk.len() > self.inner.cfg.max_response_bytes {
                 body.zeroize();
                 return Err(ExchangeError::TooLarge);
@@ -1488,12 +1494,13 @@ impl Broker {
         };
         let response = match sent {
             Ok(response) => response,
-            Err(ExchangeError::Connect(why)) => {
+            Err(ExchangeError::Connect(why, error_class)) => {
                 flight.guard.finish(TicketState::Live).await?;
                 self.disk(move |b| {
                     b.audit_lossy(&AuditEvent::Failed {
                         ticket: id,
                         reason: "connect failed; nothing sent",
+                        error_class,
                     })
                 })
                 .await;
@@ -1510,13 +1517,15 @@ impl Broker {
                     .close_refused(flight, summary, cut.code(), cut.reason())
                     .await);
             }
-            Err(ExchangeError::Upstream(why)) => {
+            Err(ExchangeError::Upstream(why, class)) => {
                 flight.guard.finish(TicketState::Uncertain).await?;
+                let error_class = Some(class);
                 let audit_reason = why.clone();
                 self.disk(move |b| {
                     b.audit_lossy(&AuditEvent::Failed {
                         ticket: id,
                         reason: &audit_reason,
+                        error_class,
                     })
                 })
                 .await;
@@ -1608,6 +1617,7 @@ impl Broker {
         let mut usage = prices.map(|_| UsageSniffer::default());
         let mut delivered = 0u64;
         let mut safe = Vec::new();
+        let mut error_class = None;
 
         let closed_by = loop {
             tokio::select! {
@@ -1629,7 +1639,10 @@ impl Broker {
                             }
                             true
                         }
-                        Err(_) => break ClosedBy::UpstreamError,
+                        Err(e) => {
+                            error_class = Some(classify(&e));
+                            break ClosedBy::UpstreamError;
+                        }
                     };
                     if !safe.is_empty() {
                         let len = safe.len() as u64;
@@ -1662,6 +1675,7 @@ impl Broker {
             withheld: closed_by == ClosedBy::Withheld,
             revoked: closed_by == ClosedBy::Revoked,
             closed_by,
+            error_class,
         };
         if let Err(e) = flight
             .guard
@@ -1736,7 +1750,64 @@ fn cut_summary(status: u16, closed_by: ClosedBy) -> StreamSummary {
         withheld: closed_by == ClosedBy::Withheld,
         revoked: closed_by == ClosedBy::Revoked,
         closed_by,
+        error_class: None,
     }
+}
+
+/// The fixed class of an HTTP client failure, for the stream summary and
+/// the audit log. The error's text is never recorded: it can carry a URL.
+fn classify(e: &reqwest::Error) -> ErrorClass {
+    // reqwest's own deadline (`buffered_timeout_ms`) is a private cause type
+    // that only `is_timeout` recognises.
+    if e.is_timeout() {
+        return ErrorClass::Timeout;
+    }
+    if let Some(class) = cause_class(e) {
+        return class;
+    }
+    if e.is_connect() {
+        ErrorClass::Connect
+    } else if e.is_body() || e.is_decode() {
+        ErrorClass::Body
+    } else {
+        ErrorClass::Other
+    }
+}
+
+/// The class named by the first recognised cause in `err`'s source chain,
+/// `err` included.
+fn cause_class(err: &(dyn std::error::Error + 'static)) -> Option<ErrorClass> {
+    use std::io::ErrorKind;
+    let mut next = Some(err);
+    while let Some(err) = next {
+        next = err.source();
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                ErrorKind::TimedOut => return Some(ErrorClass::Timeout),
+                ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe => return Some(ErrorClass::Reset),
+                ErrorKind::UnexpectedEof => return Some(ErrorClass::Closed),
+                // The TLS stream reports every rustls failure (alerts, bad
+                // records, certificate refusals) as `InvalidData`; plain
+                // HTTP parse failures arrive as `hyper::Error` instead.
+                ErrorKind::InvalidData => return Some(ErrorClass::Tls),
+                _ => {}
+            }
+            // `io::Error::source` skips a wrapped error; look inside it.
+            if let Some(inner) = io.get_ref() {
+                next = Some(inner);
+            }
+        } else if let Some(hyper) = err.downcast_ref::<hyper::Error>() {
+            if hyper.is_timeout() {
+                return Some(ErrorClass::Timeout);
+            }
+            if hyper.is_incomplete_message() {
+                return Some(ErrorClass::Closed);
+            }
+        }
+    }
+    None
 }
 
 fn audit_refusal(e: std::io::Error) -> Refusal {
@@ -2378,5 +2449,125 @@ stream_paths = ["/events"]
             Cut::Expired
         );
         flight.guard.finish(TicketState::Uncertain).await.unwrap();
+    }
+
+    /// The error class is a fixed mapping from I/O kinds and hyper states
+    /// found anywhere in the cause chain.
+    #[test]
+    fn error_class_mapping_is_pinned() {
+        use std::io::{Error, ErrorKind};
+
+        #[derive(Debug)]
+        struct Wrap(Error);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("wrapped")
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let cases = [
+            (ErrorKind::TimedOut, Some(ErrorClass::Timeout)),
+            (ErrorKind::ConnectionReset, Some(ErrorClass::Reset)),
+            (ErrorKind::ConnectionAborted, Some(ErrorClass::Reset)),
+            (ErrorKind::BrokenPipe, Some(ErrorClass::Reset)),
+            (ErrorKind::UnexpectedEof, Some(ErrorClass::Closed)),
+            (ErrorKind::InvalidData, Some(ErrorClass::Tls)),
+            (ErrorKind::ConnectionRefused, None),
+            (ErrorKind::Other, None),
+        ];
+        for (kind, class) in cases {
+            assert_eq!(cause_class(&Error::from(kind)), class, "{kind:?}");
+            assert_eq!(
+                cause_class(&Wrap(Error::from(kind))),
+                class,
+                "{kind:?} as a source"
+            );
+            assert_eq!(
+                cause_class(&Error::other(Error::from(kind))),
+                class,
+                "{kind:?} wrapped"
+            );
+        }
+
+        // The names are part of the summary and audit record formats.
+        let names: Vec<String> = [
+            ErrorClass::Timeout,
+            ErrorClass::Connect,
+            ErrorClass::Reset,
+            ErrorClass::Closed,
+            ErrorClass::Tls,
+            ErrorClass::Body,
+            ErrorClass::Other,
+        ]
+        .iter()
+        .map(|c| serde_json::to_string(c).unwrap())
+        .collect();
+        assert_eq!(
+            names,
+            [
+                r#""timeout""#,
+                r#""connect""#,
+                r#""reset""#,
+                r#""closed""#,
+                r#""tls""#,
+                r#""body""#,
+                r#""other""#
+            ]
+        );
+    }
+
+    /// Real client failures land in their classes.
+    #[tokio::test]
+    async fn client_failures_are_classified() {
+        let http = reqwest::Client::new();
+
+        // Nothing listens.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let e = http
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(classify(&e), ErrorClass::Connect, "{e:?}");
+
+        // Accepts and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(socket);
+        });
+        let e = http
+            .get(format!("http://{addr}/"))
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(classify(&e), ErrorClass::Timeout, "{e:?}");
+        held.abort();
+
+        // Reads the request and hangs up without a reply.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_head(&mut socket).await;
+        });
+        let e = http
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(classify(&e), ErrorClass::Closed, "{e:?}");
+        server.await.unwrap();
     }
 }

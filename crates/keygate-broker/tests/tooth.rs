@@ -2624,3 +2624,134 @@ async fn tooth_upstream_error_after_usage_keeps_reservation() {
     );
     server.await.unwrap();
 }
+
+/// How a test upstream ends one connection after its reply bytes.
+#[derive(Clone, Copy)]
+enum Hangup {
+    /// An orderly close (FIN).
+    Close,
+    /// An abortive close (RST): zero linger, then drop, once the test has
+    /// seen the reply bytes arrive (an RST can discard unread data).
+    Reset,
+}
+
+/// #tooth: a transport failure records a fixed error class, never the
+/// error's text: on the stream summary beside `closed_by: upstream_error`,
+/// and on the audit `failed` record of a buffered call. A clean stream end
+/// carries no class. Checked on the serialized forms callers and operators
+/// read.
+#[tokio::test]
+async fn tooth_upstream_failures_record_a_fixed_error_class() {
+    let partial = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+    // `Connection: close` keeps the next request off a pooled connection.
+    let whole = "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let script: Vec<(&'static str, Hangup)> = vec![
+        (partial, Hangup::Close),
+        (partial, Hangup::Reset),
+        (whole, Hangup::Close),
+        ("", Hangup::Close),
+    ];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rig = Rig::new(&config(&format!(
+        "http://{}",
+        listener.local_addr().unwrap()
+    )));
+    let token = rig.token("seat-a");
+    let (seen, mut proceed) = tokio::sync::mpsc::channel::<()>(1);
+    let server = tokio::spawn(async move {
+        for (reply, hangup) in script {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let length = String::from_utf8(request)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(|n| n.parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            socket.read_exact(&mut vec![0; length]).await.unwrap();
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            match hangup {
+                Hangup::Close => socket.shutdown().await.unwrap(),
+                Hangup::Reset => {
+                    proceed.recv().await.unwrap();
+                    rustix::net::sockopt::set_socket_linger(&socket, Some(Duration::ZERO)).unwrap();
+                    drop(socket);
+                }
+            }
+        }
+    });
+    let stream_call = |n: u64| {
+        call(
+            &token,
+            "llm",
+            "POST",
+            "/v1/messages",
+            &llm("m-small", 100 + n, true),
+        )
+    };
+
+    let mut classes = Vec::new();
+    for n in 0..3 {
+        let mut live = rig.live(P, stream_call(n)).await;
+        assert_eq!(&next_chunk(&mut live).await[..], b"hello");
+        seen.try_send(()).ok();
+        let (_, summary) = drain(&mut live).await;
+        let json = serde_json::to_value(&summary).unwrap();
+        classes.push((json["closed_by"].clone(), json.get("error_class").cloned()));
+    }
+    assert_eq!(
+        classes,
+        [
+            (
+                serde_json::json!("upstream_error"),
+                Some(serde_json::json!("closed"))
+            ),
+            (
+                serde_json::json!("upstream_error"),
+                Some(serde_json::json!("reset"))
+            ),
+            (serde_json::json!("upstream_eof"), None),
+        ]
+    );
+
+    // A buffered call the upstream hangs up on before replying.
+    let refusal = rig
+        .forward(S, call(&token, "api", "GET", "/repos", b""))
+        .await
+        .expect_err("a reply from an upstream that sent none");
+    assert_eq!(refusal.code, Code::UpstreamFailed);
+    server.await.unwrap();
+
+    let audit = std::fs::read_to_string(rig.state().join("audit.log")).unwrap();
+    let records: Vec<serde_json::Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failed: Vec<_> = records
+        .iter()
+        .filter(|r| r["event"] == "failed")
+        .map(|r| r.get("error_class").cloned())
+        .collect();
+    assert_eq!(failed, [Some(serde_json::json!("closed"))]);
+    let ended: Vec<_> = records
+        .iter()
+        .filter(|r| r["event"] == "stream_end")
+        .map(|r| r["summary"].get("error_class").cloned())
+        .collect();
+    assert_eq!(
+        ended,
+        [
+            Some(serde_json::json!("closed")),
+            Some(serde_json::json!("reset")),
+            None
+        ]
+    );
+}

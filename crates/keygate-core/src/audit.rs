@@ -5,7 +5,7 @@
 //! if that append fails, so there is no upstream effect without a durable
 //! record of who caused it.
 
-use crate::journal::{StreamSummary, TicketId};
+use crate::journal::{ErrorClass, StreamSummary, TicketId};
 use crate::Namespace;
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
@@ -44,8 +44,14 @@ pub enum AuditEvent<'a> {
         ticket: TicketId,
         summary: &'a StreamSummary,
     },
-    /// An exchange ended without a usable reply.
-    Failed { ticket: TicketId, reason: &'a str },
+    /// An exchange ended without a usable reply. `error_class` is set when
+    /// the HTTP client reported a transport failure.
+    Failed {
+        ticket: TicketId,
+        reason: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_class: Option<ErrorClass>,
+    },
     /// Operator action (`set`, `revoke`, `mint`, `revoke-seat`).
     Admin {
         action: &'a str,
@@ -345,6 +351,7 @@ mod tests {
         log.append(&AuditEvent::Failed {
             ticket: TicketId::from_bytes([1; 16]),
             reason: "x",
+            error_class: None,
         })
         .unwrap();
         drop(log);
@@ -365,6 +372,7 @@ mod tests {
             .append(&AuditEvent::Failed {
                 ticket: TicketId::from_bytes([2; 16]),
                 reason: "y",
+                error_class: None,
             })
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
@@ -379,7 +387,8 @@ mod tests {
         assert!(log
             .append(&AuditEvent::Failed {
                 ticket: TicketId::from_bytes([0; 16]),
-                reason: "x"
+                reason: "x",
+                error_class: None,
             })
             .is_err());
     }
@@ -491,6 +500,7 @@ mod tests {
             .append(&AuditEvent::Failed {
                 ticket: TicketId::from_bytes([2; 16]),
                 reason: "short",
+                error_class: None,
             })
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
@@ -503,6 +513,7 @@ mod tests {
             .append(&AuditEvent::Failed {
                 ticket: TicketId::from_bytes([3; 16]),
                 reason: "unremovable",
+                error_class: None,
             })
             .is_err());
         faults.fail_truncate.store(false, Ordering::SeqCst);
@@ -511,6 +522,7 @@ mod tests {
             .append(&AuditEvent::Failed {
                 ticket: TicketId::from_bytes([4; 16]),
                 reason: "blocked-by-poison",
+                error_class: None,
             })
             .is_err());
         drop(log);
@@ -524,6 +536,7 @@ mod tests {
             .append(&AuditEvent::Failed {
                 ticket: TicketId::from_bytes([5; 16]),
                 reason: "unsynced",
+                error_class: None,
             })
             .is_err());
         faults.fail_sync.store(false, Ordering::SeqCst);
@@ -532,6 +545,7 @@ mod tests {
             .append(&AuditEvent::Failed {
                 ticket: TicketId::from_bytes([6; 16]),
                 reason: "still-poisoned",
+                error_class: None,
             })
             .is_err());
 

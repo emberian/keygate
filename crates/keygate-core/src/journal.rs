@@ -110,6 +110,28 @@ pub enum ClosedBy {
     Shutdown,
 }
 
+/// What kind of transport failure ended an upstream exchange. A fixed set,
+/// read from the HTTP client's error and its causes; the error's own text
+/// is never recorded, because it can carry a URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorClass {
+    /// A connect, request or read deadline passed.
+    Timeout,
+    /// The connection could not be established.
+    Connect,
+    /// The peer reset or aborted the connection.
+    Reset,
+    /// The peer closed the connection before the message was complete.
+    Closed,
+    /// The TLS layer refused the peer's data or certificate.
+    Tls,
+    /// The reply body could not be read or decoded.
+    Body,
+    /// None of the above.
+    Other,
+}
+
 /// How a stream ended. Retained on its ticket so a retry of a spent stream
 /// learns the outcome instead of opening a duplicate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +146,10 @@ pub struct StreamSummary {
     /// The row's secret was revoked mid-stream.
     pub revoked: bool,
     pub closed_by: ClosedBy,
+    /// With `closed_by: upstream_error`, the kind of failure. Absent
+    /// otherwise, and in summaries written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<ErrorClass>,
 }
 
 /// A buffered reply kept for exact replay.
