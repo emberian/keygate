@@ -58,6 +58,7 @@ fn inside(dir: &Path) {
         let event = AuditEvent::Failed {
             ticket: TicketId::from_bytes([7; 16]),
             reason: "filling the disk with audit lines until the filesystem refuses",
+            error_class: None,
         };
         match audit.append(&event) {
             Ok(()) => written += 1,

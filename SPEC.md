@@ -79,7 +79,7 @@ How long a ticket is remembered depends on what is known about it:
 |---|---|---|---|
 | `Live` | authorized, never sent | `live_ttl_s` (default 120 s), then refunded | the same ticket, no second charge |
 | `Replayable` | buffered reply received | `retention_s` (default 900 s) | the retained reply; after the window, a new send |
-| `Closed` | stream ended | `retention_s` | its closing summary (`status, bytes, complete, withheld, revoked, closed_by`); after the window, a new stream |
+| `Closed` | stream ended | `retention_s` | its closing summary (`status, bytes, complete, withheld, revoked, closed_by`, plus `error_class` after `closed_by: upstream_error`); after the window, a new stream |
 | `Withheld` | reply contained a guarded secret | `retention_s` | a refusal; after the window, a new send |
 | `Uncertain` | may have reached the upstream; outcome unknown | at least `retention_s`, **and for as long as the token that sent it could retry** | a refusal (`uncertain`), never a send |
 
@@ -90,6 +90,7 @@ How long a ticket is remembered depends on what is known about it:
 - **Exclusive state ownership.** `Broker::open` and `Broker::init_state` acquire a nonblocking exclusive `flock` on `<state>/broker.lock` (`0600`, singly linked regular file, `O_NOFOLLOW`) before opening, recovering, or compacting any mutable file, and retain that descriptor across all `Broker` clones until mutable state is dropped. A duplicate startup fails before touching `journal.wal` or `audit.log`.
 - **Write failures and recovery.** Each journal record is appended and `fdatasync`ed before it takes effect in memory. A short write (disk full) is cut back to the last committed byte; that operation fails and the journal stays usable. If the cut-back fails, or `fdatasync` or a compaction's directory sync fails, the journal is poisoned: every later commit is refused until restart, and so is every call. On open, both `journal.wal` and `audit.log` validate every newline-terminated JSON record from byte 0 (refusing complete malformed lines anywhere in the file, including at EOF) and truncate and sync only an unterminated final record left by a crash mid-append; `audit.log` likewise rolls back short writes (`ftruncate` + `fdatasync`) and poisons on failed rollback or `fdatasync` until restart. Newly created intermediate and leaf state directories, namespace directories (`providers/`, `services/`), `master.key`, `keygate.toml`, `journal.wal`, and `audit.log` sync their parent directory entries before acknowledging dependent operations.
 - Audit-before-effect: `Begin` is appended and synced to the `0600` audit log before any upstream I/O; if that fails the call is refused.
+- Transport failures carry a fixed `error_class`: on a stream summary with `closed_by: upstream_error`, and on a `failed` audit record when the HTTP client reported the failure. It is one of `timeout`, `connect`, `reset` (the peer reset or aborted the connection), `closed` (the peer closed it before the message was complete), `tls`, `body` or `other`, read from the client's error kinds and the I/O and hyper causes in its source chain, never from its text. Elsewhere the field is absent, so summaries and records written without it still parse.
 
 ### 1.5 Budgets
 
