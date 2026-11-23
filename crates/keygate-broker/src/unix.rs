@@ -626,6 +626,28 @@ where
             )
             .await;
         }
+        Request::ReconcileGitPush { ticket, call } => {
+            let result = broker
+                .disk(move |b| {
+                    let state = b.reconcile_git_push(caller, call, ticket)?;
+                    Ok(Response::Authorized {
+                        ticket,
+                        state: state.name().into(),
+                        existing: true,
+                        reserved_micro_usd: b.ticket(ticket).map_or(0, |t| t.reserved_micro_usd),
+                    })
+                })
+                .await;
+            drop(broker);
+            return send_frame(
+                writer,
+                &answer(result),
+                deadline,
+                &mut conn.stop_rx,
+                &mut conn.shutdown_rx,
+            )
+            .await;
+        }
         Request::ProviderAuthorize(call) => {
             // Reserve for whichever operation the body asks for.
             let kind = Broker::provider_kind(&call.body);

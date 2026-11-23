@@ -113,6 +113,13 @@ enum Command {
         #[arg(long)]
         stream: bool,
     },
+    /// Reconcile this exact Git land call against the authoritative ref.
+    ReconcileGitPush {
+        #[arg(long)]
+        ticket: keygate_core::journal::TicketId,
+        #[command(flatten)]
+        call: CallArgs,
+    },
     /// Send a buffered call; the reply body goes to stdout.
     Forward {
         #[command(flatten)]
@@ -134,6 +141,10 @@ struct TokenArgs {
 
 #[derive(Args)]
 struct CaveatArgs {
+    #[arg(long, requires = "git_ref")]
+    git_repo: Option<String>,
+    #[arg(long, requires = "git_repo")]
+    git_ref: Option<String>,
     /// Require the token's seat to be exactly this.
     #[arg(long)]
     bind_seat: Option<String>,
@@ -176,6 +187,9 @@ impl CaveatArgs {
             (!items.is_empty()).then(|| make(items))
         };
         [
+            self.git_repo
+                .zip(self.git_ref)
+                .map(|(repo, reference)| Caveat::GitRef { repo, reference }),
             self.bind_seat.map(Caveat::Seat),
             self.namespace.map(Caveat::Namespace),
             list(self.rows, Caveat::Rows),
@@ -577,6 +591,18 @@ async fn run(cli: Cli) -> Fallible<ExitCode> {
                 Namespace::Service => Request::ServiceAuthorize(ServiceAuthorize { call, stream }),
             };
             print_json(&accepted(client.call(&request).await?)?)?;
+        }
+        Command::ReconcileGitPush { ticket, call } => {
+            let (ns, call) = call.into_call()?;
+            if ns != Namespace::Service {
+                return Err("Git land requires a service row".into());
+            }
+            let mut client = connect(&target).await?;
+            print_json(&accepted(
+                client
+                    .call(&Request::ReconcileGitPush { ticket, call })
+                    .await?,
+            )?)?;
         }
         Command::Forward { call } => {
             let mut client = connect(&target).await?;

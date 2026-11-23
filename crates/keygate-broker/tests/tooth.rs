@@ -2624,3 +2624,141 @@ async fn tooth_upstream_error_after_usage_keeps_reservation() {
     );
     server.await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_land_reconciles_lost_replies_and_retries_only_with_the_original_cas() {
+    use keygate_core::git_land::GitLand;
+    use std::sync::Arc;
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["-c", "user.name=B", "-c", "user.email=b@example.org"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| git(dir.path(), args);
+    run(&["init", "--bare"]);
+    let tree = run(&["mktree"]);
+    let old = run(&["commit-tree", &tree, "-m", "base"]);
+    let child = |parent: &str, msg: &str| run(&["commit-tree", &tree, "-p", parent, "-m", msg]);
+    let new = child(&old, "land");
+    let later = child(&new, "later");
+    let other = child(&old, "diverged");
+    let reference = "refs/heads/main";
+    run(&["update-ref", reference, &old]);
+    let repo = dir.path().to_owned();
+    let calls = AtomicUsize::new(0);
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let signal = changed.clone();
+    let up = Upstream::start(move |req| {
+        if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            let cas: GitLand = serde_json::from_slice(&req.body).unwrap();
+            git(
+                &repo,
+                &[
+                    "update-ref",
+                    &cas.reference,
+                    &cas.new_oid,
+                    &cas.expected_old,
+                ],
+            );
+            signal.notify_one();
+        }
+        Reply::Hang
+    })
+    .await;
+    let binding = format!(
+        "git_land_targets = {{ api = {:?} }}\ngit_land_micro_usd = 3",
+        dir.path()
+    );
+    let cfg = config(&up.origin)
+        .replace("[broker]", &format!("[broker]\n{binding}"))
+        .replace("/repos", "/git/land");
+    let rig = Rig::new(&cfg);
+    let root = rig.token("agent");
+    let scope = Caveat::GitRef {
+        repo: "api".into(),
+        reference: reference.into(),
+    };
+    let token = Broker::attenuate(
+        &root,
+        vec![
+            scope,
+            Caveat::Seat("agent".into()),
+            Caveat::MaxSpendMicroUsd(3),
+        ],
+    )
+    .unwrap();
+    let request = |reference: &str| {
+        let body = serde_json::json!({"repo":"api","reference":reference,"expected_old":old,"new_oid":new});
+        call(
+            &token,
+            "api",
+            "POST",
+            "/git/land",
+            body.to_string().as_bytes(),
+        )
+    };
+    let reserve = |call| rig.broker.authorize(S, AGENT, call, CallKind::Buffered);
+    assert_eq!(
+        reserve(request("refs/heads/other")).unwrap_err().code,
+        Code::Denied
+    );
+    let req = request(reference);
+    let id = reserve(req.clone()).unwrap().ticket;
+    let mut distinct = req.clone();
+    distinct.request_id = Some("second charge".into());
+    assert_eq!(reserve(distinct).unwrap_err().code, Code::BudgetExceeded);
+    let send = || {
+        let (broker, call) = (rig.broker.clone(), req.clone());
+        tokio::spawn(async move { broker.forward(S, AGENT, call, HeaderMode::Strict).await })
+    };
+    let lost = || async {
+        tokio::time::timeout(WAIT, async {
+            while rig.broker.ticket(id).unwrap().state == TicketState::InFlight {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    };
+    let first = send();
+    up.arrived().await;
+    first.abort();
+    let _ = first.await;
+    lost().await;
+    let reconcile = |call| rig.broker.reconcile_git_push(AGENT, call, id);
+    let mut impostor = req.clone();
+    impostor.token = root;
+    assert!(reconcile(impostor).is_err());
+    run(&["update-ref", reference, &other, &old]);
+    assert_eq!(reconcile(req.clone()).unwrap(), TicketState::Uncertain);
+    run(&["update-ref", reference, &old, &other]);
+    assert_eq!(reconcile(req.clone()).unwrap(), TicketState::SafeToRetry);
+    assert_eq!(up.hits(), 1);
+    let second = send();
+    tokio::time::timeout(WAIT, changed.notified())
+        .await
+        .unwrap();
+    second.abort();
+    let _ = second.await;
+    lost().await;
+    run(&["update-ref", reference, &later, &new]);
+    let rig = rig.reopen(BrokerOptions::default());
+    let state = rig
+        .broker
+        .reconcile_git_push(AGENT, req.clone(), id)
+        .unwrap();
+    assert_eq!(state, TicketState::Committed);
+    assert_eq!(rig.broker.ticket(id).unwrap().reserved_micro_usd, 3);
+    assert!(rig.forward(S, req).await.is_err());
+    assert_eq!(up.hits(), 2);
+}

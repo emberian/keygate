@@ -48,6 +48,10 @@ pub enum MacaroonError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Caveat {
+    GitRef {
+        repo: String,
+        reference: String,
+    },
     /// The token's seat is exactly this one.
     Seat(String),
     Namespace(Namespace),
@@ -303,9 +307,22 @@ impl Verified {
     /// Check every stateless caveat against `facts`. Spend ceilings are
     /// stateful and are enforced by the ticket journal via `spend_scopes`.
     pub fn admit(&self, facts: &Facts<'_>) -> Result<(), CaveatDenied> {
+        self.admit_with_git(facts, None)
+    }
+
+    pub fn admit_with_git(
+        &self,
+        facts: &Facts<'_>,
+        git_land: Option<&crate::git_land::GitLand>,
+    ) -> Result<(), CaveatDenied> {
         for (index, caveat) in self.caveats.iter().enumerate() {
             let deny = |reason: String| Err(CaveatDenied { index, reason });
             match caveat {
+                Caveat::GitRef { repo, reference }
+                    if !git_land.is_some_and(|g| &g.repo == repo && &g.reference == reference) =>
+                {
+                    return deny("Git repository or ref is outside the capability".into())
+                }
                 Caveat::Seat(seat) if seat != facts.seat => {
                     return deny(format!("seat is not {seat:?}"))
                 }
@@ -475,6 +492,11 @@ fn decode_root(r: &mut Reader<'_>) -> Result<RootId, MacaroonError> {
 fn encode_caveat(caveat: &Caveat) -> Result<Vec<u8>, MacaroonError> {
     let mut w = Vec::with_capacity(32);
     match caveat {
+        Caveat::GitRef { repo, reference } => {
+            w.push(10);
+            put_str(&mut w, repo)?;
+            put_str(&mut w, reference)?;
+        }
         Caveat::Seat(seat) => {
             if !crate::valid_name(seat) {
                 return Err(MacaroonError::Malformed("invalid seat"));
@@ -554,6 +576,10 @@ fn decode_caveat(enc: &[u8]) -> Result<Caveat, MacaroonError> {
         ),
         8 => Caveat::MaxSpendMicroUsd(r.u64()?),
         9 => Caveat::ExpiresAtUnixS(r.u64()?),
+        10 => Caveat::GitRef {
+            repo: r.string()?,
+            reference: r.string()?,
+        },
         // An unknown caveat is a restriction this broker cannot evaluate;
         // ignoring it would widen the token.
         _ => return Err(MacaroonError::Malformed("unknown caveat kind")),

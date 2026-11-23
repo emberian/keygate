@@ -957,7 +957,7 @@ impl Broker {
             }
         };
 
-        let (upstream, admission) = match ns {
+        let (upstream, mut admission) = match ns {
             Namespace::Provider => {
                 let row = vault.provider(&call.row)?;
                 if call.body.len() > row.upstream.max_request_bytes {
@@ -1014,17 +1014,44 @@ impl Broker {
             }
         };
 
+        let target = self
+            .config()
+            .git_land_targets
+            .get(&call.row)
+            .filter(|_| ns == Namespace::Service && call.path == "/git/land");
+        let mut land = None;
+        if let Some(repo) = target {
+            if !repo.is_absolute()
+                || method != reqwest::Method::POST
+                || kind != CallKind::Buffered
+                || query.is_some()
+                || !call.headers.is_empty()
+                || call.last_event_id.is_some()
+            {
+                return Err(Refusal::new(Code::BadRequest, "invalid Git land request"));
+            }
+            let body: keygate_core::git_land::GitLand = serde_json::from_slice(&call.body)
+                .map_err(|_| Refusal::new(Code::BadRequest, "invalid Git land CAS body"))?;
+            if !body.valid() || body.repo != call.row {
+                return Err(Refusal::new(Code::BadRequest, "invalid Git land target"));
+            }
+            admission.reserve_micro_usd = self.config().git_land_micro_usd;
+            land = Some(body);
+        }
         verified
-            .admit(&Facts {
-                seat: &seat,
-                namespace: ns,
-                row: &call.row,
-                method: method.as_str(),
-                path: &path,
-                model: admission.model.as_deref(),
-                request_bytes: call.body.len(),
-                now_unix_s: now,
-            })
+            .admit_with_git(
+                &Facts {
+                    seat: &seat,
+                    namespace: ns,
+                    row: &call.row,
+                    method: method.as_str(),
+                    path: &path,
+                    model: admission.model.as_deref(),
+                    request_bytes: call.body.len(),
+                    now_unix_s: now,
+                },
+                land.as_ref(),
+            )
             .map_err(|e| Refusal::new(Code::Denied, e.to_string()))?;
 
         let headers = forwarded_headers(upstream, &call, mode)?;
@@ -1065,7 +1092,14 @@ impl Broker {
                 })
             })
             .transpose()?;
-        let digest = request_digest(ns, kind, &call, method.as_str(), query, &headers, &verified);
+        let mut digest =
+            request_digest(ns, kind, &call, method.as_str(), query, &headers, &verified);
+        if let Some(repo) = target {
+            let binding =
+                serde_json::to_vec(&(digest, &upstream.origin, repo, admission.reserve_micro_usd))
+                    .map_err(|e| Refusal::new(Code::Internal, e.to_string()))?;
+            digest = blake3::derive_key("keygate Git CAS endpoint v1", &binding);
+        }
         Ok(Prepared {
             ns,
             row: call.row,
@@ -1086,6 +1120,55 @@ impl Broker {
             admitted_unix_s: now,
             expires_at,
         })
+    }
+
+    /// Probe the operator's authoritative local Git ref. No service call is sent.
+    pub fn reconcile_git_push(
+        &self,
+        caller: Caller,
+        call: Call,
+        id: TicketId,
+    ) -> Result<TicketState, Refusal> {
+        use crate::git_target::{GitRefProbe, TargetStateProbe};
+        let p = self.prepare(
+            Namespace::Service,
+            caller,
+            call,
+            CallKind::Buffered,
+            HeaderMode::Strict,
+        )?;
+        let path = self
+            .config()
+            .git_land_targets
+            .get(&p.row)
+            .filter(|_| p.path == "/git/land")
+            .ok_or_else(|| {
+                Refusal::new(Code::Denied, "no authoritative Git target for this call")
+            })?;
+        let ticket = self
+            .ticket(id)
+            .filter(|t| t.digest == p.digest && t.seat == p.seat)
+            .ok_or_else(|| {
+                Refusal::new(
+                    Code::Denied,
+                    "ticket does not bind this capability and Git CAS",
+                )
+            })?;
+        if ticket.state != TicketState::Uncertain {
+            return Ok(ticket.state);
+        }
+        let land = serde_json::from_slice(&p.body)
+            .map_err(|_| Refusal::new(Code::BadRequest, "invalid Git land body"))?;
+        let outcome = GitRefProbe(path)
+            .observe(&land)
+            .map_err(|e| Refusal::new(Code::Uncertain, e.to_string()))?;
+        if outcome == TicketState::Uncertain {
+            return Ok(outcome);
+        }
+        self.inner
+            .journal
+            .reconcile(&ticket, outcome)
+            .map_err(|e| Refusal::new(Code::JournalFailed, e.to_string()))
     }
 
     fn open_ticket(&self, p: &Prepared) -> Result<(Ticket, bool), Refusal> {
@@ -1276,7 +1359,7 @@ impl Broker {
         self.disk(move |broker| {
             let p = broker.prepare(ns, caller, call, kind, mode)?;
             let (ticket, _) = broker.open_ticket(&p)?;
-            let flight = if ticket.state == TicketState::Live {
+            let flight = if matches!(ticket.state, TicketState::Live | TicketState::SafeToRetry) {
                 Some(broker.begin(&p, ticket.id)?)
             } else {
                 None
@@ -1300,7 +1383,7 @@ impl Broker {
             .prepare_flight(ns, caller, call, CallKind::Buffered, mode)
             .await?;
         match ticket.state {
-            TicketState::Live => {}
+            TicketState::Live | TicketState::SafeToRetry => {}
             TicketState::Replayable(retained) => {
                 return Ok(BufferedReply {
                     ticket: ticket.id,
@@ -1756,16 +1839,17 @@ fn withheld_refusal() -> Refusal {
 /// Why a ticket that is not `Live` cannot be sent.
 fn not_live(ticket: &Ticket) -> Refusal {
     match &ticket.state {
+        TicketState::Committed => Refusal::new(Code::BadRequest,"Git ref already contains this update"),
         TicketState::InFlight => Refusal::new(Code::InFlight, "an identical request is in flight; use a distinct request_id for a deliberate repeat"),
         TicketState::Uncertain => Refusal::new(
             Code::Uncertain,
-            "an earlier attempt of this exact request may have reached the upstream and its reply was lost; it will not be re-sent, now or later, while this token is valid. To send it again deliberately, give it a new request id (Idempotency-Key)",
+            "an earlier attempt may have reached the upstream. An uncertain ticket cannot be resent. Configured Git land services support reconcile-git-push.",
         ),
         TicketState::Withheld { .. } => withheld_refusal(),
         TicketState::Closed(summary) => {
             Refusal { code: Code::BadRequest, message: "this ticket is a finished stream".to_owned(), summary: Some(summary.clone()) }
         }
-        TicketState::Live | TicketState::Replayable(_) => Refusal::new(Code::Internal, "ticket state changed underneath the request; retry"),
+        TicketState::SafeToRetry | TicketState::Live | TicketState::Replayable(_) => Refusal::new(Code::Internal, "ticket state changed underneath the request; retry"),
     }
 }
 

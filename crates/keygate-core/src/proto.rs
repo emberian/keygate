@@ -40,6 +40,10 @@ pub enum Request {
     ProviderStream(Call),
     ServiceAuthorize(ServiceAuthorize),
     ServiceForward(Call),
+    ReconcileGitPush {
+        ticket: TicketId,
+        call: Call,
+    },
     ServiceStream(Call),
     /// Operator: load or rotate a row's secret.
     Set {

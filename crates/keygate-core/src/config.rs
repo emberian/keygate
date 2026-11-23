@@ -57,6 +57,10 @@ pub enum Deployment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BrokerCfg {
+    /// Service row -> authoritative repository of its fast-forward-only CAS endpoint.
+    pub git_land_targets: BTreeMap<String, PathBuf>,
+    /// Reservation for one configured Git land service call.
+    pub git_land_micro_usd: u64,
     pub deployment: Deployment,
     /// Unix socket path; relative paths are resolved against the state dir.
     pub socket: PathBuf,
@@ -99,6 +103,8 @@ pub struct BrokerCfg {
 impl Default for BrokerCfg {
     fn default() -> Self {
         BrokerCfg {
+            git_land_targets: BTreeMap::new(),
+            git_land_micro_usd: 0,
             deployment: Deployment::Separated,
             socket: PathBuf::from("keygate.sock"),
             socket_mode: 0o600,

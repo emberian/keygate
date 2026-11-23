@@ -145,10 +145,14 @@ pub enum TicketState {
     /// Buffered call finished; the reply replays on exact retry.
     Replayable(Retained),
     /// The request may have reached the upstream but no reply was
-    /// delivered. Never re-sent.
+    /// delivered. Requires positive reconciliation before another send.
     Uncertain,
+    Committed,
+    SafeToRetry,
     /// A buffered reply contained a guarded secret and was dropped.
-    Withheld { status: u16 },
+    Withheld {
+        status: u16,
+    },
     /// Stream finished.
     Closed(StreamSummary),
 }
@@ -156,6 +160,8 @@ pub enum TicketState {
 impl TicketState {
     pub const fn name(&self) -> &'static str {
         match self {
+            TicketState::Committed => "committed",
+            TicketState::SafeToRetry => "safe_to_retry",
             TicketState::Live => "live",
             TicketState::InFlight => "in_flight",
             TicketState::Replayable(_) => "replayable",
@@ -176,6 +182,8 @@ pub struct Ticket {
     pub row: String,
     pub kind: CallKind,
     pub state: TicketState,
+    #[serde(default)]
+    pub revision: u64,
     pub expires_unix_s: u64,
     /// Ledger keys this ticket's reservation was charged to.
     pub ledger_keys: Vec<String>,
@@ -344,6 +352,7 @@ impl State {
                     }
                     self.uncertain -= usize::from(ticket.state == TicketState::Uncertain);
                     self.uncertain += usize::from(state == TicketState::Uncertain);
+                    ticket.revision += 1;
                     ticket.state = state;
                     ticket.expires_unix_s = expires_unix_s;
                 }
@@ -404,7 +413,9 @@ impl State {
         match ticket.state {
             TicketState::InFlight => false,
             _ if ticket.expires_unix_s > now_unix_s => false,
-            TicketState::Uncertain => !self.owner_can_retry(ticket, now_unix_s),
+            TicketState::Uncertain | TicketState::Committed | TicketState::SafeToRetry => {
+                !self.owner_can_retry(ticket, now_unix_s)
+            }
             _ => true,
         }
     }
@@ -655,6 +666,7 @@ impl Journal {
             row: new.row,
             kind: new.kind,
             state: TicketState::Live,
+            revision: 0,
             expires_unix_s: new.now_unix_s.saturating_add(new.live_ttl_s),
             ledger_keys: if new.reserve_micro_usd > 0 {
                 new.charges.into_iter().map(|c| c.key).collect()
@@ -675,7 +687,7 @@ impl Journal {
         let Some(ticket) = inner.state.tickets.get(&id) else {
             return Ok(Begin::Missing);
         };
-        if ticket.state != TicketState::Live {
+        if !matches!(ticket.state, TicketState::Live | TicketState::SafeToRetry) {
             return Ok(Begin::NotLive(Box::new(ticket.clone())));
         }
         let expires_unix_s = ticket.expires_unix_s;
@@ -685,6 +697,29 @@ impl Journal {
             expires_unix_s,
         })?;
         Ok(Begin::Started)
+    }
+
+    /// Commit an observation only against the same uncertain attempt the probe saw.
+    pub fn reconcile(&self, snapshot: &Ticket, outcome: TicketState) -> io::Result<TicketState> {
+        let mut inner = self.lock();
+        let ticket = inner
+            .state
+            .tickets
+            .get(&snapshot.id)
+            .ok_or_else(|| io::Error::other("ticket no longer exists"))?;
+        if ticket.revision != snapshot.revision || ticket.state != TicketState::Uncertain {
+            return Ok(ticket.state.clone());
+        }
+        if !matches!(outcome, TicketState::Committed | TicketState::SafeToRetry) {
+            return Err(io::Error::other("invalid reconciliation outcome"));
+        }
+        let expires_unix_s = ticket.expires_unix_s;
+        inner.commit(Rec::State {
+            id: snapshot.id,
+            state: outcome.clone(),
+            expires_unix_s,
+        })?;
+        Ok(outcome)
     }
 
     /// Record a new state; the ticket is then retained until `expires_unix_s`.
@@ -969,6 +1004,22 @@ mod tests {
 
     fn journal(dir: &Path) -> Journal {
         Journal::open(&dir.join("journal.wal"), 1_000_000, 60).unwrap()
+    }
+
+    #[test]
+    fn stale_git_probe_cannot_unlock_a_later_uncertain_attempt() {
+        use TicketState::{SafeToRetry, Uncertain};
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = journal(dir.path());
+        let id = ledger.authorize(new("a", 1, 0, vec![])).unwrap().0.id;
+        ledger.begin(id).unwrap();
+        ledger.transition(id, Uncertain, NOW + 60).unwrap();
+        let stale = ledger.get(id).unwrap();
+        assert_eq!(ledger.reconcile(&stale, SafeToRetry).unwrap(), SafeToRetry);
+        assert!(matches!(ledger.begin(id).unwrap(), Begin::Started));
+        ledger.transition(id, Uncertain, NOW + 60).unwrap();
+        assert_eq!(ledger.reconcile(&stale, SafeToRetry).unwrap(), Uncertain);
+        assert!(matches!(ledger.begin(id).unwrap(), Begin::NotLive(_)));
     }
 
     fn reply() -> TicketState {

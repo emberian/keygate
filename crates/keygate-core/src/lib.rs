@@ -189,3 +189,5 @@ mod tests {
         assert_ne!(Namespace::Provider.dir(), Namespace::Service.dir());
     }
 }
+
+pub mod git_land;
