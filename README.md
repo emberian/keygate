@@ -89,3 +89,38 @@ an outcome that could still be retried.
 ## License
 
 Licensed under either the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option.
+
+### Running JavaScript handlers
+
+`keygate-worker` supervises a persistent pool on Linux with Bubblewrap, util-linux
+`prlimit`, and system Node with `vm.constants.DONT_CONTEXTIFY`. Each worker gets
+a private user, PID and network namespace, a read-only Node runtime, empty environment
+and framed pipes. The Rust supervisor owns the macaroon and the 50 ms invocation
+deadline. An interrupted call can already have reached its service. Reuse the same
+request ID when retrying or reconciling a Git operation.
+
+Configure `broker.pod_seats` to map each pod service row to its verified seat,
+and `broker.pod_micro_usd` to set the charge for a claim or completion. Configure
+the row's POST paths and provision its credential for the matching landd pod principal.
+Git operations use the existing authoritative `broker.git_land_targets` configuration.
+
+```sh
+keygate-worker --socket "$socket" --token-file "$token_file" --seat ci \
+  --pod-row pods --git-row forge --max-spend-micro-usd 500 --workers 2 \
+  --allow pod.claim,pod.done,git.land,git.reconcile
+```
+
+Use one pool per trust principal. Requests and responses are JSON with a four-byte
+big-endian length prefix and a 64 KiB limit. Wait for the ready frame before sending
+requests of the form `{"id":1,"source":"return yield caps.pod.claim(input)","input":...}`.
+The input to a claim has `pod`, `task`, `lease_seconds` and `request_id`. A completion
+takes `fencing_token` in place of `lease_seconds`. Git calls take `cas` and `request_id`,
+with the ticket additionally required for reconciliation. The supervisor returns
+typed results and request IDs. Realms are private to a worker, principal and exact
+handler source. Instances of the same handler can retain realm state between calls.
+
+Run `node --test scripts/worker-context.test.cjs` for the realm and wire checks.
+With built binaries on PATH, `python3 scripts/worker-acceptance.py` exercises the
+jail, real pod transactions, spend refusal and an authoritative Git ref update
+whose reply was lost. The benchmark places its journal and database on the
+filesystem selected by `TMPDIR` and includes their synchronization latency.

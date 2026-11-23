@@ -137,6 +137,7 @@ struct Inner {
     broker_uid: u32,
     seats: watch::Sender<Arc<BTreeMap<String, u64>>>,
     seat_admin: Mutex<()>,
+    ref_readers: Mutex<crate::git_target::RefReaders>,
     disk_slots: Arc<Semaphore>,
     /// Flips to `true` once; every flight and stream watches it.
     shutdown: watch::Sender<bool>,
@@ -438,6 +439,7 @@ impl Broker {
                 broker_uid,
                 seats: watch::Sender::new(Arc::new(seats)),
                 seat_admin: Mutex::new(()),
+                ref_readers: Mutex::default(),
                 disk_slots: Arc::new(Semaphore::new(16)),
                 shutdown: watch::Sender::new(false),
                 flights: watch::Sender::new(0),
@@ -1019,6 +1021,22 @@ impl Broker {
             .git_land_targets
             .get(&call.row)
             .filter(|_| ns == Namespace::Service && call.path == "/git/land");
+        let pod_seat = self
+            .config()
+            .pod_seats
+            .get(&call.row)
+            .filter(|_| ns == Namespace::Service);
+        if let Some(principal) = pod_seat {
+            if principal != &seat
+                || !matches!(path.as_str(), "/pod/claim" | "/pod/done")
+                || method != reqwest::Method::POST
+                || kind != CallKind::Buffered
+                || query.is_some()
+            {
+                return Err(Refusal::new(Code::Denied, "outside pod service grant"));
+            }
+            admission.reserve_micro_usd = self.config().pod_micro_usd;
+        }
         let mut land = None;
         if let Some(repo) = target {
             if !repo.is_absolute()
@@ -1094,6 +1112,16 @@ impl Broker {
             .transpose()?;
         let mut digest =
             request_digest(ns, kind, &call, method.as_str(), query, &headers, &verified);
+        if let Some(principal) = pod_seat {
+            let binding = serde_json::to_vec(&(
+                digest,
+                &upstream.origin,
+                principal,
+                admission.reserve_micro_usd,
+            ))
+            .map_err(|e| Refusal::new(Code::Internal, e.to_string()))?;
+            digest = blake3::derive_key("keygate pod endpoint v1", &binding);
+        }
         if let Some(repo) = target {
             let binding =
                 serde_json::to_vec(&(digest, &upstream.origin, repo, admission.reserve_micro_usd))
@@ -1159,9 +1187,20 @@ impl Broker {
         }
         let land = serde_json::from_slice(&p.body)
             .map_err(|_| Refusal::new(Code::BadRequest, "invalid Git land body"))?;
-        let outcome = GitRefProbe(path)
-            .observe(&land)
-            .map_err(|e| Refusal::new(Code::Uncertain, e.to_string()))?;
+        let committed = self
+            .inner
+            .ref_readers
+            .lock()
+            .expect("ref readers")
+            .committed(path, &land)
+            .unwrap_or(false);
+        let outcome = if committed {
+            TicketState::Committed
+        } else {
+            GitRefProbe(path)
+                .observe(&land)
+                .map_err(|e| Refusal::new(Code::Uncertain, e.to_string()))?
+        };
         if outcome == TicketState::Uncertain {
             return Ok(outcome);
         }

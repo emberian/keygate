@@ -61,6 +61,9 @@ pub struct BrokerCfg {
     pub git_land_targets: BTreeMap<String, PathBuf>,
     /// Reservation for one configured Git land service call.
     pub git_land_micro_usd: u64,
+    /// Each pod service credential represents exactly this verified seat.
+    pub pod_seats: BTreeMap<String, String>,
+    pub pod_micro_usd: u64,
     pub deployment: Deployment,
     /// Unix socket path; relative paths are resolved against the state dir.
     pub socket: PathBuf,
@@ -105,6 +108,8 @@ impl Default for BrokerCfg {
         BrokerCfg {
             git_land_targets: BTreeMap::new(),
             git_land_micro_usd: 0,
+            pod_seats: BTreeMap::new(),
+            pod_micro_usd: 1,
             deployment: Deployment::Separated,
             socket: PathBuf::from("keygate.sock"),
             socket_mode: 0o600,
