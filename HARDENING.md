@@ -140,3 +140,20 @@ The other seven points of that review concern a different project and have no di
 - Directory-entry `fsync` ordering is covered by boundary instrumentation and fault injection, not by physical power-loss testing.
 - The gateway has no peer credentials; any local process holding a valid token can use it there.
 - Separated deployment is supported on Linux only.
+
+
+## Worker dispatch and disk latency, 2026-11-23
+
+The 2 ms real-disk target remains open. These are end-to-end medians in milliseconds from the release worker acceptance harness. Each run used 64 sequential dispatches, 64 independent claims, 64 completions using the returned tokens and 16 fresh authoritative Git reconciliations. The settled-ticket replay has its own timing.
+
+| State and Git storage | Dispatch | Pod claim | Pod done | Git reconcile |
+|---|---:|---:|---:|---:|
+| Linux tmpfs, colocated | 0.365 | 0.925 | 0.934 | 1.000 |
+| Linux ext4, colocated | 0.300 | 4.414 | 4.858 | 2.216 |
+| Linux tmpfs, sandboxed worker in local KVM guest | 2.801 | 6.035 | 5.927 | 6.635 |
+| Linux ext4, sandboxed worker in local KVM guest | 2.746 | 17.665 | 17.451 | 11.785 |
+| macOS APFS shared over VirtioFS with a Linux guest | 0.934 | 4.229 | 3.819 | 6.176 |
+
+The KVM runs kept the broker, pod service, destination repository and timer on the host. A private SSH Unix-socket forward connected the worker to the broker. Three Git land fixture calls timed out on ext4. In the APFS run the guest ran the x86-64 Rust executables through Rosetta, used native Linux Node, and placed only the broker socket on guest tmpfs. Two Git land fixture calls timed out. The harness retained first-attempt timings and failed the timeout gate after reporting the medians.
+
+A separate 128-write ext4 control on the KVM host measured 3.07 ms median for one 500-byte append and `fdatasync`. Immediate pod calls still require a durable in-flight ticket, an independently synced pre-send audit entry, and a durable outcome before acknowledgement. For a colocated run, place the release binaries on `PATH`, set `TMPDIR` to a private directory on the filesystem being measured, and run `python3 scripts/worker-acceptance.py`. Use `--socket-dir` when the data filesystem cannot host the broker's Unix socket.

@@ -259,6 +259,8 @@ pub struct JournalFaults {
     pub fail_sync: AtomicBool,
     pub fail_truncate: AtomicBool,
     pub fail_dir_sync: AtomicBool,
+    /// Counts the `fdatasync`s commits issue.
+    pub syncs: AtomicU64,
 }
 
 impl Default for JournalFaults {
@@ -268,6 +270,7 @@ impl Default for JournalFaults {
             fail_sync: AtomicBool::new(false),
             fail_truncate: AtomicBool::new(false),
             fail_dir_sync: AtomicBool::new(false),
+            syncs: AtomicU64::new(0),
         }
     }
 }
@@ -604,6 +607,16 @@ impl Journal {
     /// Returns the ticket and whether it already existed. An exact retry
     /// gets the same ticket back and is not charged again.
     pub fn authorize(&self, new: NewTicket) -> Result<(Ticket, bool), JournalError> {
+        self.admit(new, false)
+    }
+
+    /// For an immediate send, reserve and claim a new ticket in a single
+    /// Open record. A retry sees its actual state under the same index lock.
+    pub fn authorize_in_flight(&self, new: NewTicket) -> Result<(Ticket, bool), JournalError> {
+        self.admit(new, true)
+    }
+
+    fn admit(&self, new: NewTicket, in_flight: bool) -> Result<(Ticket, bool), JournalError> {
         let mut inner = self.lock();
         while let Some(&(expires, id)) = inner.state.live_expiries.first() {
             if expires > new.now_unix_s {
@@ -665,8 +678,12 @@ impl Journal {
             namespace: new.namespace,
             row: new.row,
             kind: new.kind,
-            state: TicketState::Live,
-            revision: 0,
+            state: if in_flight {
+                TicketState::InFlight
+            } else {
+                TicketState::Live
+            },
+            revision: u64::from(in_flight),
             expires_unix_s: new.now_unix_s.saturating_add(new.live_ttl_s),
             ledger_keys: if new.reserve_micro_usd > 0 {
                 new.charges.into_iter().map(|c| c.key).collect()
@@ -833,11 +850,11 @@ impl Inner {
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        if self
-            .fault()
-            .is_some_and(|f| f.fail_sync.load(Ordering::SeqCst))
-        {
-            return Err(injected("fdatasync"));
+        if let Some(faults) = self.fault() {
+            if faults.fail_sync.load(Ordering::SeqCst) {
+                return Err(injected("fdatasync"));
+            }
+            faults.syncs.fetch_add(1, Ordering::SeqCst);
         }
         self.file.sync_data()
     }
@@ -1004,6 +1021,72 @@ mod tests {
 
     fn journal(dir: &Path) -> Journal {
         Journal::open(&dir.join("journal.wal"), 1_000_000, 60).unwrap()
+    }
+
+    /// #tooth: a ticket opened to send at once is durably `InFlight` after a
+    /// single `fdatasync`, so a crash right after it comes back `Uncertain`
+    /// and is never re-sent. Remove the initial claim from
+    /// `authorize_in_flight` and it reopens `Live`; commit the records one
+    /// by one and the sync count is 2.
+    #[test]
+    fn tooth_ticket_opened_in_flight_is_one_durable_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let faults = Arc::new(JournalFaults::default());
+        let j = Journal::open_with_faults(&path, 1_000_000, 60, Some(faults.clone())).unwrap();
+        let (opened, existing) = j.authorize_in_flight(new("a", 1, 5, vec![])).unwrap();
+        assert!(!existing);
+        assert_eq!(opened.state, TicketState::InFlight);
+        assert_eq!(faults.syncs.load(Ordering::SeqCst), 1);
+        assert_eq!(j.get(opened.id).unwrap().state, TicketState::InFlight);
+        let (again, existing) = j.authorize_in_flight(new("a", 1, 5, vec![])).unwrap();
+        assert!(
+            existing && again.state == TicketState::InFlight,
+            "an exact retry finds the claimed ticket"
+        );
+        assert_eq!(faults.syncs.load(Ordering::SeqCst), 1);
+        drop(j);
+        assert_eq!(
+            journal(dir.path()).get(opened.id).unwrap().state,
+            TicketState::Uncertain
+        );
+    }
+
+    /// A crash that tears the initial record leaves no reservation:
+    /// nothing was sent, since sending waits for the commit.
+    #[test]
+    fn torn_in_flight_open_does_not_reserve_a_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let j = journal(dir.path());
+        let id = j.authorize_in_flight(new("a", 1, 0, vec![])).unwrap().0.id;
+        drop(j);
+        let len = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 3)
+            .unwrap();
+        assert!(journal(dir.path()).get(id).is_none());
+    }
+
+    /// A failed sync reserves no ticket and poisons the journal.
+    #[test]
+    fn failed_sync_of_an_in_flight_open_applies_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let faults = Arc::new(JournalFaults::default());
+        let j = Journal::open_with_faults(
+            &dir.path().join("journal.wal"),
+            1_000_000,
+            60,
+            Some(faults.clone()),
+        )
+        .unwrap();
+        faults.fail_sync.store(true, Ordering::SeqCst);
+        assert!(j.authorize_in_flight(new("a", 1, 0, vec![])).is_err());
+        assert_eq!(j.stats().tickets, 0);
+        assert!(j.poisoned().is_some());
     }
 
     #[test]

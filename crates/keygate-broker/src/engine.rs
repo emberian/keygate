@@ -206,6 +206,29 @@ struct Prepared {
     expires_at: Option<tokio::time::Instant>,
 }
 
+impl Prepared {
+    fn check_expiry(&self) -> Result<(), Refusal> {
+        if self
+            .expires_at
+            .is_some_and(|at| tokio::time::Instant::now() >= at)
+        {
+            return Err(Refusal::new(
+                Code::Denied,
+                "the token expired before the request could begin",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What `begin` checks before a ticket may be claimed: the token has not
+/// expired and the row has a live secret.
+struct Armed {
+    secret: Arc<ActiveSecret>,
+    automaton: Arc<EchoAutomaton>,
+    epoch: watch::Receiver<RowEpoch>,
+}
+
 /// A claimed ticket with its `Begin` audited: the network may now be used.
 struct Flight {
     guard: FlightGuard,
@@ -546,9 +569,10 @@ impl Broker {
     }
 
     /// For audit records written after the effect, where there is nothing
-    /// left to fail closed.
+    /// left to fail closed. The journal already holds the outcome durably,
+    /// so the record trails: the next synced append makes it durable.
     fn audit_lossy(&self, event: &AuditEvent<'_>) {
-        if let Err(e) = self.inner.audit.append(event) {
+        if let Err(e) = self.inner.audit.append_trailing(event) {
             eprintln!("keygate: audit append failed after the fact: {e}");
         }
     }
@@ -1210,29 +1234,34 @@ impl Broker {
             .map_err(|e| Refusal::new(Code::JournalFailed, e.to_string()))
     }
 
-    fn open_ticket(&self, p: &Prepared) -> Result<(Ticket, bool), Refusal> {
-        self.inner
-            .journal
-            .authorize(NewTicket {
-                seat: p.seat.clone(),
-                digest: p.digest,
-                namespace: p.ns,
-                row: p.row.clone(),
-                kind: p.kind,
-                charges: p.charges.clone(),
-                reserve_micro_usd: p.reserve_micro_usd,
-                now_unix_s: p.admitted_unix_s,
-                live_ttl_s: self.inner.cfg.live_ttl_s,
-                owner_expires_unix_s: p.expires_at_unix_s,
-                root_epoch: p.root_epoch,
-            })
-            .map_err(|e| match e {
-                JournalError::Budget { .. } => Refusal::new(Code::BudgetExceeded, e.to_string()),
-                JournalError::UncertainFull { .. } => {
-                    Refusal::new(Code::NoResendLedgerFull, e.to_string())
-                }
-                other => Refusal::new(Code::JournalFailed, other.to_string()),
-            })
+    /// Open or find the ticket. With `in_flight`, a new ticket is committed
+    /// already claimed (`Journal::authorize_in_flight`).
+    fn open_ticket(&self, p: &Prepared, in_flight: bool) -> Result<(Ticket, bool), Refusal> {
+        let new = NewTicket {
+            seat: p.seat.clone(),
+            digest: p.digest,
+            namespace: p.ns,
+            row: p.row.clone(),
+            kind: p.kind,
+            charges: p.charges.clone(),
+            reserve_micro_usd: p.reserve_micro_usd,
+            now_unix_s: p.admitted_unix_s,
+            live_ttl_s: self.inner.cfg.live_ttl_s,
+            owner_expires_unix_s: p.expires_at_unix_s,
+            root_epoch: p.root_epoch,
+        };
+        let opened = if in_flight {
+            self.inner.journal.authorize_in_flight(new)
+        } else {
+            self.inner.journal.authorize(new)
+        };
+        opened.map_err(|e| match e {
+            JournalError::Budget { .. } => Refusal::new(Code::BudgetExceeded, e.to_string()),
+            JournalError::UncertainFull { .. } => {
+                Refusal::new(Code::NoResendLedgerFull, e.to_string())
+            }
+            other => Refusal::new(Code::JournalFailed, other.to_string()),
+        })
     }
 
     /// Check a call and reserve its ticket without sending anything.
@@ -1244,7 +1273,7 @@ impl Broker {
         kind: CallKind,
     ) -> Result<Authorized, Refusal> {
         let p = self.prepare(ns, caller, call, kind, HeaderMode::Strict)?;
-        let (ticket, existing) = self.open_ticket(&p)?;
+        let (ticket, existing) = self.open_ticket(&p, false)?;
         Ok(Authorized {
             ticket: ticket.id,
             state: ticket.state.name(),
@@ -1254,15 +1283,13 @@ impl Broker {
     }
 
     /// Steps 3 and 4: claim the ticket and audit `Begin`. No network yet.
-    fn begin(&self, p: &Prepared, id: TicketId) -> Result<Flight, Refusal> {
-        if p.expires_at
-            .is_some_and(|at| tokio::time::Instant::now() >= at)
-        {
-            return Err(Refusal::new(
-                Code::Denied,
-                "the token expired before the request could begin",
-            ));
-        }
+    fn begin(&self, p: &Prepared, id: TicketId, armed: Armed) -> Result<Flight, Refusal> {
+        self.claim(id)?;
+        self.launch(p, id, armed)
+    }
+
+    fn arm(&self, p: &Prepared) -> Result<Armed, Refusal> {
+        p.check_expiry()?;
         let upstream = self.inner.vault.upstream(p.ns, &p.row)?;
         let Some((secret, automaton)) = self.inner.vault.snapshot(upstream) else {
             let epoch = upstream.epoch();
@@ -1281,8 +1308,14 @@ impl Broker {
                 )
             });
         };
-        let epoch = upstream.watch();
+        Ok(Armed {
+            secret,
+            automaton,
+            epoch: upstream.watch(),
+        })
+    }
 
+    fn claim(&self, id: TicketId) -> Result<(), Refusal> {
         match self.inner.journal.begin(id) {
             Ok(Begin::Started) => {}
             Ok(Begin::NotLive(ticket)) => return Err(not_live(&ticket)),
@@ -1299,6 +1332,16 @@ impl Broker {
                 ))
             }
         }
+        Ok(())
+    }
+
+    /// Count the claimed ticket in flight and audit `Begin`.
+    fn launch(&self, p: &Prepared, id: TicketId, armed: Armed) -> Result<Flight, Refusal> {
+        let Armed {
+            secret,
+            automaton,
+            epoch,
+        } = armed;
         self.inner
             .flights
             .send_modify(|open| *open = open.saturating_add(1));
@@ -1327,6 +1370,17 @@ impl Broker {
             guard.armed = false;
             self.record(id, TicketState::Live)?;
             return Err(audit_refusal(e));
+        }
+        // Admission, the journal commit and the Begin sync may all block.
+        // Recheck before handing the flight to the network sender.
+        if let Err(expired) = p.check_expiry() {
+            guard.armed = false;
+            self.record(id, TicketState::Live)?;
+            self.audit_lossy(&AuditEvent::Failed {
+                ticket: id,
+                reason: "expired before send",
+            });
+            return Err(expired);
         }
         // Only streams are cut at expiry; a buffered call already in flight
         // is bounded by `buffered_timeout_ms`.
@@ -1397,11 +1451,16 @@ impl Broker {
     ) -> Result<(Prepared, Ticket, Option<Flight>), Refusal> {
         self.disk(move |broker| {
             let p = broker.prepare(ns, caller, call, kind, mode)?;
-            let (ticket, _) = broker.open_ticket(&p)?;
-            let flight = if matches!(ticket.state, TicketState::Live | TicketState::SafeToRetry) {
-                Some(broker.begin(&p, ticket.id)?)
-            } else {
-                None
+            // Check what could refuse the send first, so a new ticket can be
+            // opened and claimed in one durable commit.
+            let armed = broker.arm(&p);
+            let (ticket, existing) = broker.open_ticket(&p, armed.is_ok())?;
+            let flight = match (&ticket.state, existing) {
+                (TicketState::InFlight, false) => Some(broker.launch(&p, ticket.id, armed?)?),
+                (TicketState::Live | TicketState::SafeToRetry, _) => {
+                    Some(broker.begin(&p, ticket.id, armed?)?)
+                }
+                _ => None,
             };
             Ok((p, ticket, flight))
         })
@@ -1422,7 +1481,7 @@ impl Broker {
             .prepare_flight(ns, caller, call, CallKind::Buffered, mode)
             .await?;
         match ticket.state {
-            TicketState::Live | TicketState::SafeToRetry => {}
+            _ if flight.is_some() => {}
             TicketState::Replayable(retained) => {
                 return Ok(BufferedReply {
                     ticket: ticket.id,
@@ -1591,7 +1650,7 @@ impl Broker {
             .await?;
         let id = ticket.id;
         match ticket.state {
-            TicketState::Live => {}
+            _ if flight.is_some() => {}
             TicketState::Closed(summary) => {
                 return Ok(StreamOutcome::Spent {
                     ticket: id,
@@ -2170,8 +2229,8 @@ stream_paths = ["/events"]
                         HeaderMode::Strict,
                     )
                     .unwrap();
-                let ticket = b.open_ticket(&p).unwrap().0;
-                let flight = b.begin(&p, ticket.id).unwrap();
+                let ticket = b.open_ticket(&p, false).unwrap().0;
+                let flight = b.begin(&p, ticket.id, b.arm(&p).unwrap()).unwrap();
                 (p, flight)
             })
             .await;
@@ -2443,13 +2502,19 @@ stream_paths = ["/events"]
                 HeaderMode::Strict,
             )
             .unwrap();
-        // Stand in for journal/audit contention after prepare.
+        let armed = broker.arm(&p).unwrap();
+        // Stand in for journal/audit contention after admission.
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(unix_time().unwrap() >= expires);
         let err = broker
             .disk(move |b| {
-                let (ticket, _) = b.open_ticket(&p).unwrap();
-                b.begin(&p, ticket.id).map(|_| ())
+                let (ticket, _) = b.open_ticket(&p, true).unwrap();
+                let result = b.launch(&p, ticket.id, armed).map(|_| ());
+                assert_eq!(
+                    b.inner.journal.get(ticket.id).unwrap().state,
+                    TicketState::Live
+                );
+                result
             })
             .await
             .unwrap_err();
@@ -2489,8 +2554,8 @@ stream_paths = ["/events"]
                         HeaderMode::Strict,
                     )
                     .unwrap();
-                let (ticket, _) = b.open_ticket(&p).unwrap();
-                b.begin(&p, ticket.id).unwrap()
+                let (ticket, _) = b.open_ticket(&p, false).unwrap();
+                b.begin(&p, ticket.id, b.arm(&p).unwrap()).unwrap()
             })
             .await;
         tokio::time::sleep(Duration::from_millis(2100)).await;

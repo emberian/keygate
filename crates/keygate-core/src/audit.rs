@@ -3,7 +3,10 @@
 //!
 //! The broker appends `Begin` *before* any upstream I/O and refuses the call
 //! if that append fails, so there is no upstream effect without a durable
-//! record of who caused it.
+//! record of who caused it. Records of what happened afterwards, whose
+//! outcome the journal already holds durably, go through `append_trailing`:
+//! written at once and made durable by the next `append`'s `fdatasync` (or
+//! when the writer is dropped), so they never hold up a reply.
 
 use crate::journal::{StreamSummary, TicketId};
 use crate::Namespace;
@@ -73,11 +76,13 @@ const MAX_RECORD_BYTES: usize = 128 << 10;
 
 struct Inner {
     file: File,
-    /// File length after the last complete, synced record.
+    /// File length after the last complete write.
     good_len: u64,
     /// Set when rollback or `fdatasync` leaves durability uncertain.
     poisoned: Option<String>,
     faults: Option<Arc<AuditFaults>>,
+    /// Records written by `append_trailing` since the last `fdatasync`.
+    trailing: bool,
 }
 
 /// Fault injection for the audit log's storage calls (tests only).
@@ -89,6 +94,8 @@ pub struct AuditFaults {
     pub short_write_after: AtomicU64,
     pub fail_sync: AtomicBool,
     pub fail_truncate: AtomicBool,
+    /// Counts the `fdatasync`s appends issue.
+    pub syncs: AtomicU64,
 }
 
 impl Default for AuditFaults {
@@ -97,6 +104,7 @@ impl Default for AuditFaults {
             short_write_after: AtomicU64::new(u64::MAX),
             fail_sync: AtomicBool::new(false),
             fail_truncate: AtomicBool::new(false),
+            syncs: AtomicU64::new(0),
         }
     }
 }
@@ -214,6 +222,7 @@ impl AuditLog {
                 good_len,
                 poisoned: None,
                 faults,
+                trailing: false,
             }),
         })
     }
@@ -234,6 +243,7 @@ impl AuditLog {
                 good_len,
                 poisoned,
                 faults: None,
+                trailing: false,
             }),
         }
     }
@@ -251,6 +261,21 @@ impl AuditLog {
     /// rolled back and synced; an uncertain rollback or failed `fdatasync`
     /// poisons all subsequent appends until reopen.
     pub fn append(&self, event: &AuditEvent<'_>) -> io::Result<()> {
+        self.write_record(event, true)
+    }
+
+    /// Append one event after the fact without waiting for stable storage:
+    /// the next `append` syncs it along with its own record. A failed write
+    /// is rolled back exactly as in `append`.
+    pub fn append_trailing(&self, event: &AuditEvent<'_>) -> io::Result<()> {
+        let outcome = matches!(
+            event,
+            AuditEvent::End { .. } | AuditEvent::Failed { .. } | AuditEvent::StreamEnd { .. }
+        );
+        self.write_record(event, !outcome)
+    }
+
+    fn write_record(&self, event: &AuditEvent<'_>, sync: bool) -> io::Result<()> {
         let ts_unix_ms = crate::unix_time_ms().map_err(io::Error::other)?;
         let mut line = serde_json::to_vec(&Line { ts_unix_ms, event })?;
         line.push(b'\n');
@@ -279,12 +304,27 @@ impl AuditLog {
             }
             return Err(e);
         }
-        if let Err(e) = inner.sync() {
-            inner.poison(format!("fdatasync failed: {e}"));
-            return Err(e);
+        if sync {
+            if let Err(e) = inner.sync() {
+                inner.poison(format!("fdatasync failed: {e}"));
+                return Err(e);
+            }
+            inner.trailing = false;
+        } else {
+            inner.trailing = true;
         }
         inner.good_len += line.len() as u64;
         Ok(())
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if self.trailing && self.poisoned.is_none() {
+            if let Err(e) = self.sync() {
+                eprintln!("keygate: audit log could not sync its trailing records: {e}");
+            }
+        }
     }
 }
 
@@ -307,12 +347,11 @@ impl Inner {
     }
 
     fn sync(&self) -> io::Result<()> {
-        if self
-            .faults
-            .as_ref()
-            .is_some_and(|f| f.fail_sync.load(Ordering::SeqCst))
-        {
-            return Err(injected("fdatasync"));
+        if let Some(faults) = &self.faults {
+            if faults.fail_sync.load(Ordering::SeqCst) {
+                return Err(injected("fdatasync"));
+            }
+            faults.syncs.fetch_add(1, Ordering::SeqCst);
         }
         self.file.sync_data()
     }
@@ -328,6 +367,46 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #tooth: a trailing record costs no `fdatasync` of its own; the next
+    /// `append` makes it durable. Sync in `append_trailing` and the count
+    /// after the two records is 2.
+    #[test]
+    fn tooth_trailing_record_rides_the_next_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let faults = Arc::new(AuditFaults::default());
+        let log = AuditLog::open_with_faults(&path, Some(faults.clone())).unwrap();
+        let synced = faults.syncs.load(Ordering::SeqCst);
+        let end = AuditEvent::End {
+            ticket: TicketId::from_bytes([2; 16]),
+            status: 200,
+            bytes: 3,
+            withheld: false,
+        };
+        log.append_trailing(&end).unwrap();
+        assert_eq!(faults.syncs.load(Ordering::SeqCst), synced);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""event":"end""#),
+            "readable at once"
+        );
+        log.append(&AuditEvent::Failed {
+            ticket: TicketId::from_bytes([3; 16]),
+            reason: "x",
+        })
+        .unwrap();
+        assert_eq!(faults.syncs.load(Ordering::SeqCst), synced + 1);
+        log.append_trailing(&end).unwrap();
+        drop(log);
+        assert_eq!(
+            faults.syncs.load(Ordering::SeqCst),
+            synced + 2,
+            "dropping the writer syncs what trails"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+    }
 
     #[test]
     fn appends_durable_lines_at_0600() {

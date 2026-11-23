@@ -157,7 +157,17 @@ pub const STATE_LOCK_FILE: &str = "broker.lock";
 /// replaceable WAL inode would fail to exclude a competing compaction). Keep
 /// this descriptor open until every mutable state handle has been dropped.
 pub(crate) struct StateLock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // A concurrent spawn can hold a duplicate until exec closes its fds.
+        // This owner has finished dropping every mutable state handle.
+        while let Err(rustix::io::Errno::INTR) =
+            rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock)
+        {}
+    }
 }
 
 impl StateLock {
@@ -199,7 +209,7 @@ impl StateLock {
                 Err(e) => return Err(io::Error::from(e)),
             }
         }
-        Ok(StateLock { _file: file })
+        Ok(StateLock { file })
     }
 }
 
@@ -476,8 +486,10 @@ mod tests {
         let first = StateLock::acquire(dir.path(), uid).unwrap();
         let err = StateLock::acquire(dir.path(), uid).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        let inherited = first.file.try_clone().unwrap();
         drop(first);
         let second = StateLock::acquire(dir.path(), uid).unwrap();
+        drop(inherited);
         drop(second);
 
         let lock_path = dir.path().join(STATE_LOCK_FILE);
