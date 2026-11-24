@@ -123,7 +123,18 @@ pub fn bind(path: &Path, mode: u32) -> io::Result<UnixListener> {
     let staging = PathBuf::from(staging);
     let listener = UnixListener::bind(&staging)?;
     let installed = std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(mode))
-        .and_then(|()| std::fs::rename(&staging, path));
+        .and_then(|()| {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                std::fs::rename(&staging, path)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                // Another listener may have bound this name since the probe.
+                std::fs::hard_link(&staging, path)?;
+                std::fs::remove_file(&staging)
+            }
+        });
     if let Err(e) = installed {
         let _ = std::fs::remove_file(&staging);
         return Err(e);

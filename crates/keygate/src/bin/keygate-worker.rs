@@ -14,7 +14,7 @@ use keygate_broker::{
 use keygate_core::{
     git_land::GitLand,
     journal::TicketId,
-    macaroon::{Caveat, MacaroonError, MacaroonV1},
+    macaroon::{Caveat, MacaroonError, MacaroonV1, WorkerRoutes},
     proto::{Call, Request, Response, ServiceAuthorize},
     Namespace,
 };
@@ -26,12 +26,12 @@ use std::{
     io::{self, Read},
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
-    process::{ExitCode, Stdio},
+    process::{Child, Command, ExitCode, Stdio},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{ChildStdin, ChildStdout},
     sync::{mpsc, Mutex},
     time::timeout,
 };
@@ -149,6 +149,45 @@ fn refused(flag: &str, path: &Path, why: impl std::fmt::Display) -> io::Error {
     )
 }
 
+/// Check the custody of links as well as the canonical destination. A
+/// trusted executable reached through a replaceable alias has no stable name.
+fn resolve_tool(path: &Path, uid: u32, links: &mut usize) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::from("/");
+    for part in path.components() {
+        match part {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                resolved.push(name);
+                let meta = std::fs::symlink_metadata(&resolved)?;
+                if meta.is_symlink() {
+                    let dir = resolved.parent().expect("link has a name");
+                    check_trusted_dirs(dir, uid)?;
+                    if meta.uid() != 0 && meta.uid() != uid {
+                        return Err(refused("symlink", &resolved, "untrusted link owner"));
+                    }
+                    if *links >= 40 {
+                        return Err(refused("symlink", &resolved, "too many links"));
+                    }
+                    *links += 1;
+                    let target = dir.join(std::fs::read_link(&resolved)?);
+                    resolved = resolve_tool(&target, uid, links)?;
+                }
+            }
+            Component::ParentDir => {
+                // Only a link target can contain this component.
+                check_trusted_dirs(&resolved, uid)?;
+                resolved.pop();
+            }
+            Component::Prefix(_) => return Err(io::Error::other("unexpected path prefix")),
+        }
+    }
+    // Confirm the kernel resolves the same name, including trailing slashes.
+    if std::fs::canonicalize(path)? != resolved {
+        return Err(refused("toolchain", path, "changed during resolution"));
+    }
+    Ok(resolved)
+}
+
 /// What `lstat` reports about a verified file. Writing to it, replacing it,
 /// or changing its mode or owner changes at least one field, and `ctime`
 /// cannot be set back.
@@ -181,6 +220,7 @@ impl Identity {
 #[derive(Debug)]
 struct Binary {
     flag: &'static str,
+    configured: PathBuf,
     path: PathBuf,
     identity: Identity,
     sha256: Option<Digest>,
@@ -200,7 +240,7 @@ impl Binary {
         digest: bool,
     ) -> io::Result<Self> {
         check_spelling(path).map_err(|why| misspelt(flag, why))?;
-        let canonical = std::fs::canonicalize(path).map_err(|e| refused(flag, path, e))?;
+        let canonical = resolve_tool(path, uid, &mut 0).map_err(|e| refused(flag, path, e))?;
         let meta =
             std::fs::symlink_metadata(&canonical).map_err(|e| refused(flag, &canonical, e))?;
         let mode = meta.mode() & 0o7777;
@@ -264,14 +304,29 @@ impl Binary {
         }
         Ok(Binary {
             flag,
+            configured: path.to_owned(),
             path: canonical,
             identity,
             sha256,
         })
     }
 
-    fn unchanged(&self) -> bool {
-        std::fs::symlink_metadata(&self.path).is_ok_and(|meta| Identity::of(&meta) == self.identity)
+    fn recheck(&self) -> io::Result<()> {
+        let current = Self::verify(
+            self.flag,
+            &self.configured,
+            self.sha256.as_ref(),
+            effective_uid(),
+            false,
+        )?;
+        if current.path != self.path || current.identity != self.identity {
+            return Err(refused(
+                self.flag,
+                &self.configured,
+                "changed after it was verified; restart the pool to verify it again",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -308,7 +363,7 @@ fn sha256_of(flag: &str, path: &Path, identity: Identity) -> io::Result<Digest> 
 fn verify_lib_dir(path: &Path, uid: u32) -> io::Result<PathBuf> {
     const FLAG: &str = "--node-lib-dir";
     check_spelling(path).map_err(|why| misspelt(FLAG, why))?;
-    let canonical = std::fs::canonicalize(path).map_err(|e| refused(FLAG, path, e))?;
+    let canonical = resolve_tool(path, uid, &mut 0).map_err(|e| refused(FLAG, path, e))?;
     let meta = std::fs::symlink_metadata(&canonical).map_err(|e| refused(FLAG, &canonical, e))?;
     let mode = meta.mode() & 0o7777;
     if !meta.is_dir() {
@@ -331,6 +386,7 @@ struct VerifiedToolchain {
     bwrap: Binary,
     node: Binary,
     lib_dirs: Vec<PathBuf>,
+    configured_lib_dirs: Vec<PathBuf>,
 }
 
 impl VerifiedToolchain {
@@ -347,6 +403,7 @@ impl VerifiedToolchain {
             )?,
             bwrap: binary("--bwrap-bin", &options.bwrap_bin, &options.bwrap_sha256)?,
             node: binary("--node-bin", &options.node_bin, &options.node_sha256)?,
+            configured_lib_dirs: options.node_lib_dirs.clone(),
             lib_dirs: options
                 .node_lib_dirs
                 .iter()
@@ -357,18 +414,25 @@ impl VerifiedToolchain {
 
     /// Before a worker is restarted, each binary must still be the file that
     /// was verified. If one is not, the pool stops rather than run it.
-    fn recheck(&self) -> io::Result<()> {
-        match [&self.prlimit, &self.bwrap, &self.node]
-            .into_iter()
-            .find(|binary| !binary.unchanged())
-        {
-            None => Ok(()),
-            Some(binary) => Err(refused(
-                binary.flag,
-                &binary.path,
-                "changed after it was verified; restart the pool to verify it again",
-            )),
-        }
+    async fn recheck(self: &Arc<Self>) -> io::Result<()> {
+        // Reading a pinned executable must not block the watchdogs of other workers.
+        let tools = self.clone();
+        tokio::task::spawn_blocking(move || {
+            for binary in [&tools.prlimit, &tools.bwrap, &tools.node] {
+                binary.recheck()?;
+            }
+            for (configured, canonical) in tools.configured_lib_dirs.iter().zip(&tools.lib_dirs) {
+                if verify_lib_dir(configured, effective_uid())? != *canonical {
+                    return Err(refused(
+                        "--node-lib-dir",
+                        configured,
+                        "directory changed after verification",
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .await?
     }
 
     /// prlimit bounds the jail's address space, core dumps, descriptors and
@@ -387,6 +451,9 @@ impl VerifiedToolchain {
                 "--unshare-all",
                 "--unshare-user",
                 "--disable-userns",
+                // Node is the namespace init. Its exit tears down the jail
+                // and the outer monitor waits for it directly.
+                "--as-pid-1",
                 "--die-with-parent",
                 "--new-session",
                 "--cap-drop",
@@ -535,10 +602,7 @@ impl Grant {
     /// The caveats come in a fixed order, and each list follows the
     /// operations' order, so equal grants make byte-identical tokens however
     /// `--allow` was written. Tickets belong to the exact token that opened
-    /// them: a `git.reconcile` pool settles what a `git.land` pool with the
-    /// same options left uncertain. Granting every operation reproduces the
-    /// caveats of earlier releases, which narrowed nothing, so such a pool
-    /// keeps its token across the upgrade.
+    /// them. The final caveat binds each exact route and broker operation.
     fn caveats(&self, seat: &str, max_spend_micro_usd: u64) -> Vec<Caveat> {
         let mut rows: Vec<String> = Vec::new();
         let mut paths: Vec<String> = Vec::new();
@@ -559,6 +623,12 @@ impl Grant {
             Caveat::Methods(vec!["POST".into()]),
             Caveat::PathPrefixes(paths),
             Caveat::MaxSpendMicroUsd(max_spend_micro_usd),
+            Caveat::WorkerRoutes(WorkerRoutes {
+                claim: self.row(Operation::Claim).map(str::to_owned),
+                done: self.row(Operation::Done).map(str::to_owned),
+                land: self.row(Operation::Land).map(str::to_owned),
+                reconcile: self.row(Operation::Reconcile).map(str::to_owned),
+            }),
         ]
     }
 }
@@ -611,8 +681,63 @@ struct Job {
     input: Value,
 }
 
+/// Bubblewrap's outer monitor must survive long enough to reap its child.
+struct Jail {
+    monitor: Child,
+    #[cfg(target_os = "linux")]
+    init: Option<std::os::fd::OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl Jail {
+    /// Capture the monitor's one namespace-init child after the ready frame.
+    /// Check parentage again after opening the pidfd to exclude PID reuse.
+    fn init_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
+        use rustix::process::{pidfd_open, Pid, PidfdFlags};
+        let monitor = self.monitor.id();
+        let children = format!("/proc/{monitor}/task/{monitor}/children");
+        let child = std::fs::read_to_string(&children)?;
+        let pid = child
+            .trim()
+            .parse()
+            .ok()
+            .and_then(Pid::from_raw)
+            .ok_or_else(bad)?;
+        let fd = pidfd_open(pid, PidfdFlags::empty())?;
+        if std::fs::read_to_string(children)? != child {
+            return Err(bad());
+        }
+        Ok(fd)
+    }
+}
+
+impl Drop for Jail {
+    fn drop(&mut self) {
+        if matches!(self.monitor.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::process::{pidfd_send_signal, Signal};
+            // Startup failures may occur before the ready frame.
+            let init = self.init.take().or_else(|| self.init_fd().ok());
+            if let Some(fd) = init {
+                match pidfd_send_signal(fd, Signal::KILL) {
+                    Ok(()) | Err(rustix::io::Errno::SRCH) => {
+                        let _ = self.monitor.wait();
+                        return;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        let _ = self.monitor.kill();
+        let _ = self.monitor.wait();
+    }
+}
+
 struct Worker {
-    _child: Child,
+    jail: Jail,
     reader: ChildStdout,
     writer: ChildStdin,
 }
@@ -624,17 +749,21 @@ impl Worker {
     /// Start a jailed Node from the verified toolchain and wait until it is
     /// ready. `stderr` receives what the jail itself reports.
     async fn start(toolchain: &VerifiedToolchain, stderr: Stdio) -> io::Result<Self> {
-        let mut child = toolchain
+        let child = toolchain
             .command()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
-            .kill_on_drop(true)
             .spawn()?;
+        let mut jail = Jail {
+            monitor: child,
+            #[cfg(target_os = "linux")]
+            init: None,
+        };
         let mut w = Self {
-            reader: child.stdout.take().ok_or_else(bad)?,
-            writer: child.stdin.take().ok_or_else(bad)?,
-            _child: child,
+            reader: ChildStdout::from_std(jail.monitor.stdout.take().ok_or_else(bad)?)?,
+            writer: ChildStdin::from_std(jail.monitor.stdin.take().ok_or_else(bad)?)?,
+            jail,
         };
         let ready = timeout(STARTUP, w.frame()).await.map_err(|_| {
             io::Error::new(
@@ -645,8 +774,17 @@ impl Worker {
         if ready != json!({"ready":true}) {
             return Err(bad());
         }
+        #[cfg(target_os = "linux")]
+        {
+            w.jail.init = Some(w.jail.init_fd()?);
+        }
         Ok(w)
     }
+    async fn stop(self) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || drop(self.jail)).await?;
+        Ok(())
+    }
+
     async fn frame(&mut self) -> io::Result<Value> {
         let bytes = read_frame_limited(&mut self.reader, LIMIT)
             .await?
@@ -887,7 +1025,7 @@ async fn serve(pool: Pool, toolchain: Arc<VerifiedToolchain>) -> Result<(), Box<
     let out = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..pool.workers {
-        toolchain.recheck()?;
+        toolchain.recheck().await?;
         let first = Worker::start(&toolchain, Stdio::null())
             .await
             .map_err(|e| {
@@ -906,7 +1044,7 @@ async fn serve(pool: Pool, toolchain: Arc<VerifiedToolchain>) -> Result<(), Box<
                 let job = { recv.lock().await.recv().await };
                 let Some(job) = job else { break };
                 if worker.is_none() {
-                    if let Err(changed) = toolchain.recheck() {
+                    if let Err(changed) = toolchain.recheck().await {
                         let reply = json!({"ok":false,"reason":"toolchain","id":job.id});
                         write_frame(&mut *out.lock().await, &reply).await?;
                         return Err(changed);
@@ -917,7 +1055,7 @@ async fn serve(pool: Pool, toolchain: Arc<VerifiedToolchain>) -> Result<(), Box<
                     match timeout(DEADLINE, w.invoke(&job, &mut bridge)).await {
                         Ok(Ok(value)) => value,
                         failure => {
-                            worker.take();
+                            worker.take().expect("active worker").stop().await?;
                             bridge.client.take();
                             json!({"ok":false,"reason":if failure.is_err(){"timeout"}else{"worker"}})
                         }
@@ -928,6 +1066,7 @@ async fn serve(pool: Pool, toolchain: Arc<VerifiedToolchain>) -> Result<(), Box<
                 result["id"] = job.id.into();
                 write_frame(&mut *out.lock().await, &result).await?;
             }
+            if let Some(worker) = worker { worker.stop().await?; }
             Ok::<_, io::Error>(())
         });
     }
@@ -968,7 +1107,7 @@ async fn run(options: Options) -> Result<(), Box<dyn Error>> {
         let worker = Worker::start(&toolchain, Stdio::inherit())
             .await
             .map_err(|e| format!("the sandbox did not start: {e}"))?;
-        drop(worker);
+        worker.stop().await?;
         println!("{}", toolchain.report());
         return Ok(());
     }
@@ -1117,36 +1256,14 @@ mod tests {
     }
 
     #[test]
-    fn equal_grants_make_equal_tokens_and_the_full_grant_keeps_its_token() {
+    fn grant_order_is_irrelevant_and_git_operations_get_distinct_tokens() {
         let parent = offline_parent();
         let land = token(&parent, &[Land]);
-        assert_eq!(
-            token(&parent, &[Reconcile]),
-            land,
-            "reconcile can settle what land left uncertain"
-        );
-        assert_eq!(token(&parent, &[Reconcile, Land]), land);
+        assert_ne!(token(&parent, &[Reconcile]), land);
+        assert_ne!(token(&parent, &[Reconcile, Land]), land);
         assert_eq!(
             token(&parent, &[Claim, Land]),
             token(&parent, &[Land, Claim])
-        );
-        assert_ne!(token(&parent, &[Claim]), token(&parent, &[Done]));
-
-        // The caveats every pool carried before grants were narrowed.
-        let mut earlier = MacaroonV1::decode(&parent).unwrap();
-        for caveat in [
-            Caveat::Seat("ci".into()),
-            Caveat::Namespace(Namespace::Service),
-            Caveat::Rows(strings(&["pods", "forge"])),
-            Caveat::Methods(strings(&["POST"])),
-            Caveat::PathPrefixes(strings(&["/pod/claim", "/pod/done", "/git/land"])),
-            Caveat::MaxSpendMicroUsd(500),
-        ] {
-            earlier = earlier.attenuate(caveat).unwrap();
-        }
-        assert_eq!(
-            token(&parent, &[Claim, Done, Land, Reconcile]),
-            earlier.encode()
         );
     }
 
@@ -1239,6 +1356,171 @@ buffered_paths = ["/git/land"]
         }
     }
 
+    /// Check both gates independently. Every permitted bridge effect uses the
+    /// real Unix broker, and direct calls present the pool token without Bridge.
+    #[tokio::test]
+    async fn every_grant_matches_the_bridge_and_the_broker() {
+        use keygate_broker::Listeners;
+        use keygate_core::secret::SecretBytes;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let http = tokio::spawn(async move {
+            loop {
+                let (socket, _) = upstream.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut length = 0;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+                }
+                socket.read_exact(&mut vec![0; length]).await.unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"fencing_token\":\"1\"}").await.unwrap();
+            }
+        });
+        let state = private_dir();
+        Broker::init_state(state.path()).unwrap();
+        let config = Config::parse(&format!(
+            r#"
+[broker]
+deployment = "development"
+git_land_targets = {{ forge = "/srv/forge.git" }}
+[services.forge]
+origin = "http://{address}"
+methods = ["POST"]
+buffered_paths = ["/"]
+stream_paths = ["/"]
+[services.pods]
+origin = "http://{address}"
+methods = ["POST"]
+buffered_paths = ["/"]
+"#
+        ))
+        .unwrap();
+        let broker = Broker::open(state.path(), config, BrokerOptions::default()).unwrap();
+        for row in ["pods", "forge"] {
+            broker
+                .set(
+                    Namespace::Service,
+                    row,
+                    SecretBytes::new(b"matrix-private-credential".to_vec()),
+                    false,
+                    false,
+                    OPERATOR,
+                )
+                .unwrap();
+        }
+        let listeners = Listeners::bind(&broker).await.unwrap();
+        let socket = Arc::new(listeners.socket_path.clone());
+        let serving = tokio::spawn(listeners.run(broker.clone()));
+        let parent = broker.mint("ci", None, vec![], OPERATOR).unwrap();
+        let ops = [Claim, Done, Land, Reconcile];
+        let cas = json!({"repo":"forge","reference":"refs/heads/main","expected_old":"a".repeat(40),"new_oid":"b".repeat(40)});
+        for mask in 1..16 {
+            let allow: Vec<_> = ops
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, op)| *op)
+                .collect();
+            let grant = grant(&allow);
+            let credential = token(&parent, &allow);
+            let id = format!("matrix-{mask}");
+            let mut opener = allow.clone();
+            if !opener.contains(&Land) {
+                opener.retain(|op| *op != Reconcile);
+                opener.push(Land);
+            }
+            let git = |token: &str| service_call(token, "forge", Land, &cas, id.clone()).unwrap();
+            let ticket = broker
+                .authorize(
+                    Namespace::Service,
+                    AGENT,
+                    git(&token(&parent, &opener)),
+                    CallKind::Buffered,
+                )
+                .unwrap()
+                .ticket;
+            let mut bridge = Bridge {
+                socket: socket.clone(),
+                grant: Arc::new(grant),
+                token: Arc::new(Zeroizing::new(credential.clone())),
+                client: None,
+            };
+            for (op, name, mut body) in [
+                (
+                    Claim,
+                    "pod.claim",
+                    json!({"pod":"batch","task":"1","lease_seconds":60}),
+                ),
+                (
+                    Done,
+                    "pod.done",
+                    json!({"pod":"batch","task":"1","fencing_token":"1"}),
+                ),
+                (Land, "git.land", json!({"cas":cas})),
+                (
+                    Reconcile,
+                    "git.reconcile",
+                    json!({"cas":cas, "ticket":ticket}),
+                ),
+            ] {
+                let row = if op.is_pod() { "pods" } else { "forge" };
+                let call = service_call(
+                    &credential,
+                    row,
+                    op,
+                    if op.is_pod() { &body } else { &cas },
+                    id.clone(),
+                )
+                .unwrap();
+                let authorization = if op == Reconcile {
+                    broker.reconcile_git_push(AGENT, call, ticket).map(drop)
+                } else {
+                    broker
+                        .authorize(Namespace::Service, AGENT, call, CallKind::Buffered)
+                        .map(drop)
+                };
+                if allow.contains(&op) {
+                    authorization.unwrap();
+                } else {
+                    assert_eq!(
+                        authorization.unwrap_err().code,
+                        Code::Denied,
+                        "{mask}: {op:?}"
+                    );
+                }
+                body["request_id"] = json!(id);
+                let effect = serde_json::from_value(json!({"op":name, "body":body})).unwrap();
+                let reply = bridge.apply(effect).await.unwrap();
+                assert_eq!(reply["ok"], allow.contains(&op), "{mask}: {name}: {reply}");
+            }
+            // Even mixed grants cannot combine one row with another row's
+            // path or turn an allowed endpoint into a subtree.
+            for path in ["/pod/claim", "/git/land/extra"] {
+                let mut call = git(&credential);
+                call.path = path.into();
+                assert_eq!(
+                    broker
+                        .authorize(Namespace::Service, AGENT, call, CallKind::Buffered)
+                        .unwrap_err()
+                        .code,
+                    Code::Denied
+                );
+            }
+        }
+        serving.abort();
+        http.abort();
+    }
+
     /// A fresh temporary directory carries the umask's group bits; where
     /// that is 002 the custody checks (rightly) refuse what is inside it.
     fn private_dir() -> tempfile::TempDir {
@@ -1305,12 +1587,29 @@ buffered_paths = ["/git/land"]
         // A symlink is resolved once; what runs is its target.
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&good.path, &link).unwrap();
-        assert_eq!(verify(&link).unwrap().path, good.path);
+        let via_link = verify(&link).unwrap();
+        assert_eq!(via_link.path, good.path);
+        for mode in [0o644, 0o775, 0o757] {
+            let target = fixture(dir.path(), "bad-target", mode);
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            assert!(verify(&link).is_err());
+            assert!(via_link.recheck().is_err());
+        }
 
         let uid = effective_uid();
         if uid != 0 {
             let err = Binary::verify("--node-bin", &good.path, None, uid + 1, false).unwrap_err();
             assert!(err.to_string().contains("owned by uid"), "{err}");
+        } else {
+            let target = fixture(dir.path(), "foreign", 0o755);
+            let alias = dir.path().join("foreign-link");
+            std::os::unix::fs::symlink(&target, &alias).unwrap();
+            let before = verify(&alias).unwrap();
+            std::os::unix::fs::chown(&target, Some(1), None).unwrap();
+            for error in [before.recheck().unwrap_err(), verify(&alias).unwrap_err()] {
+                assert!(error.to_string().contains("owned by uid 1"), "{error}");
+            }
         }
 
         // Others who can write the directory can swap the file, sticky or not.
@@ -1363,7 +1662,7 @@ buffered_paths = ["/git/land"]
     fn recheck_notices_a_rewritten_replaced_or_rechmodded_binary() {
         let dir = private_dir();
         let verified = |name: &str| verify(&fixture(dir.path(), name, 0o755)).unwrap();
-        assert!(verified("kept").unchanged());
+        assert!(verified("kept").recheck().is_ok());
 
         let rewritten = verified("rewritten");
         std::fs::OpenOptions::new()
@@ -1372,15 +1671,15 @@ buffered_paths = ["/git/land"]
             .unwrap()
             .write_all(b"d")
             .unwrap();
-        assert!(!rewritten.unchanged());
+        assert!(rewritten.recheck().is_err());
 
         let replaced = verified("replaced");
         std::fs::rename(fixture(dir.path(), "same-bytes", 0o755), &replaced.path).unwrap();
-        assert!(!replaced.unchanged(), "same bytes, different file");
+        assert!(replaced.recheck().is_err(), "same bytes, different file");
 
         let rechmodded = verified("rechmodded");
         std::fs::set_permissions(&rechmodded.path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(!rechmodded.unchanged());
+        assert!(rechmodded.recheck().is_err());
     }
 
     #[test]

@@ -6,7 +6,7 @@ The broker keeps upstream credentials in a sealed store. Callers hold attenuable
 
 ## Development status
 
-Experimental. Three rounds of security hardening have been applied — including an independent review and a follow-up audit — recorded finding by finding in [HARDENING.md](HARDENING.md), with the test that pins each fix. The suite (unit tests, adversarial integration tests over the real Unix socket and HTTP gateway, fault injection, a run on a genuinely full filesystem, real separated-uid acceptance, and end-to-end tests of the binary) passes on Linux. It also builds without warnings on macOS, where only the worker's unit and refusal tests and the socket-replacement test have been run.
+Experimental. Three rounds of security hardening have been applied — including an independent review and a follow-up audit — recorded finding by finding in [HARDENING.md](HARDENING.md), with the test that pins each fix. The suite (unit tests, adversarial integration tests over the real Unix socket and HTTP gateway, fault injection, a run on a genuinely full filesystem, real separated-uid acceptance, and end-to-end tests of the binary) passes on Linux. The workspace also builds and tests on macOS. The worker jail and separated deployment require Linux.
 
 Things that are true whatever the tests say:
 
@@ -111,17 +111,20 @@ keygate-worker --socket "$socket" --token-file "$token_file" --seat ci \
   --allow pod.claim,pod.done,git.land,git.reconcile
 ```
 
-The pool's macaroon admits only the rows and paths its `--allow` operations use:
-`pod.claim` and `pod.done` call `--pod-row` at `/pod/claim` and `/pod/done`;
-`git.land` and `git.reconcile` call `--git-row` at `/git/land` (the broker admits a
-reconcile as the land call it settles). A row no allowed operation uses need not be
-given and is not granted. Tickets belong to the exact token that opened them, and
-pools with equal options hold equal tokens however `--allow` is ordered, so a
-`git.reconcile` pool settles what a `git.land` pool with the same options left
-uncertain. A pool granted all four operations holds the token earlier releases gave
-every pool. A pool granted fewer now holds a narrower token, and `Uncertain` tickets
-it opened before the upgrade cannot be reconciled through it.
+The broker checks the pool's signed grant against the exact service row, path,
+and operation. Pod claims and completions use `--pod-row`. Sending a Git land
+and reconciling its ticket both name `--git-row` and `/git/land`, with separate
+permissions for sending and reconciliation. Supply each row that the grant uses.
+A reconcile-only pool can settle an uncertain ticket from a land-only pool with
+the same parent token, seat, spend cap, row and pod permissions. The request ID
+and Git CAS must match the original call.
 
+Upgrade the broker before starting workers that use signed operation grants.
+Older brokers refuse the new caveat. All worker tokens change across this
+upgrade. Settle outstanding Git tickets using their original credentials.
+
+The Linux supervisor uses procfs child enumeration and pidfds to stop a timed-out
+namespace process and wait for its Bubblewrap monitor to reap it.
 The jail runs `/usr/bin/prlimit`, `/usr/bin/bwrap` and `/usr/bin/node` unless
 `--prlimit-bin`, `--bwrap-bin` and `--node-bin` name other absolute paths. `PATH` is
 never searched, and a relative path or one containing `..` is refused before anything
@@ -131,8 +134,11 @@ others, in a directory writable by neither, below directories only root or that 
 can rearrange (sticky directories excepted). `--prlimit-sha256`, `--bwrap-sha256`
 and `--node-sha256` pin a binary's SHA-256. Node is bound into each sandbox at its
 canonical path; `--node-lib-dir` binds another directory its shared libraries need,
-under the same rules, and never one that contains the token file or the socket.
-Before restarting a worker after a timeout or crash, the supervisor checks that each
+under the same rules. Every file in that directory is visible to the jail. Use a
+dedicated runtime directory. Startup refuses a directory containing the configured
+token file or broker socket.
+Before restarting a worker after a timeout or crash, the supervisor resolves the configured
+paths again, checks directory custody, recomputes pinned hashes, and checks that each
 binary is still the file it verified (device, inode, size, mode, owner, modification
 and change times). If one is not, it answers that job with `"reason":"toolchain"`
 and exits with an error; restart the pool to verify the new files.

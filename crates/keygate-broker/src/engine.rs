@@ -23,7 +23,9 @@ use keygate_core::journal::{
     self, Begin, CallKind, Charge, ClosedBy, Journal, JournalError, JournalFaults, NewTicket,
     RequestDigest32, Retained, StreamSummary, Ticket, TicketId, TicketState,
 };
-use keygate_core::macaroon::{self, Caveat, Facts, MacaroonV1, RootId, Verified, TOKEN_PREFIX};
+use keygate_core::macaroon::{
+    self, Caveat, Facts, Invocation, MacaroonV1, RootId, Verified, TOKEN_PREFIX,
+};
 use keygate_core::path::{check_query, PlainPath};
 use keygate_core::proto::{Call, Code, Refusal, RowInfo, StatusInfo};
 use keygate_core::seal::{write_atomic, MasterKey, SealStore};
@@ -952,9 +954,13 @@ impl Broker {
         ns: Namespace,
         caller: Caller,
         call: Call,
-        kind: CallKind,
+        invocation: Invocation,
         mode: HeaderMode,
     ) -> Result<Prepared, Refusal> {
+        let kind = match invocation {
+            Invocation::Forward(kind) => kind,
+            Invocation::Reconcile => CallKind::Buffered,
+        };
         // Capture both clocks up front so journal or audit contention never
         // grants extra lifetime to a short-lived capability.
         let admitted_at = tokio::time::Instant::now();
@@ -1081,7 +1087,7 @@ impl Broker {
             land = Some(body);
         }
         verified
-            .admit_with_git(
+            .admit_invocation(
                 &Facts {
                     seat: &seat,
                     namespace: ns,
@@ -1093,6 +1099,7 @@ impl Broker {
                     now_unix_s: now,
                 },
                 land.as_ref(),
+                invocation,
             )
             .map_err(|e| Refusal::new(Code::Denied, e.to_string()))?;
 
@@ -1134,8 +1141,19 @@ impl Broker {
                 })
             })
             .transpose()?;
-        let mut digest =
-            request_digest(ns, kind, &call, method.as_str(), query, &headers, &verified);
+        let owner = match invocation {
+            Invocation::Reconcile => verified.reconcile_owner.unwrap_or(verified.owner),
+            Invocation::Forward(_) => verified.owner,
+        };
+        let mut digest = request_digest(
+            ns,
+            kind,
+            &call,
+            method.as_str(),
+            query,
+            &headers,
+            (&owner, &verified.spend_scopes),
+        );
         if let Some(principal) = pod_seat {
             let binding = serde_json::to_vec(&(
                 digest,
@@ -1186,7 +1204,7 @@ impl Broker {
             Namespace::Service,
             caller,
             call,
-            CallKind::Buffered,
+            Invocation::Reconcile,
             HeaderMode::Strict,
         )?;
         let path = self
@@ -1272,7 +1290,13 @@ impl Broker {
         call: Call,
         kind: CallKind,
     ) -> Result<Authorized, Refusal> {
-        let p = self.prepare(ns, caller, call, kind, HeaderMode::Strict)?;
+        let p = self.prepare(
+            ns,
+            caller,
+            call,
+            Invocation::Forward(kind),
+            HeaderMode::Strict,
+        )?;
         let (ticket, existing) = self.open_ticket(&p, false)?;
         Ok(Authorized {
             ticket: ticket.id,
@@ -1450,7 +1474,7 @@ impl Broker {
         mode: HeaderMode,
     ) -> Result<(Prepared, Ticket, Option<Flight>), Refusal> {
         self.disk(move |broker| {
-            let p = broker.prepare(ns, caller, call, kind, mode)?;
+            let p = broker.prepare(ns, caller, call, Invocation::Forward(kind), mode)?;
             // Check what could refuse the send first, so a new ticket can be
             // opened and claimed in one durable commit.
             let armed = broker.arm(&p);
@@ -2106,7 +2130,7 @@ fn request_digest(
     method: &str,
     query: Option<&str>,
     headers: &HeaderMap,
-    verified: &Verified,
+    (owner, spend_scopes): (&[u8; 32], &[macaroon::SpendScope]),
 ) -> RequestDigest32 {
     fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
@@ -2116,8 +2140,8 @@ fn request_digest(
     // Tickets belong to the exact token that opened them: a different
     // token, even of the same seat and even one attenuated from this one,
     // gets its own ticket, its own reservation and no view of this reply.
-    field(&mut hasher, &verified.owner);
-    let mut scopes: Vec<&[u8; 32]> = verified.spend_scopes.iter().map(|s| &s.id).collect();
+    field(&mut hasher, owner);
+    let mut scopes: Vec<&[u8; 32]> = spend_scopes.iter().map(|s| &s.id).collect();
     scopes.sort_unstable();
     hasher.update(&(scopes.len() as u64).to_le_bytes());
     for scope in scopes {
@@ -2225,7 +2249,7 @@ stream_paths = ["/events"]
                         Namespace::Service,
                         caller,
                         call,
-                        CallKind::Buffered,
+                        Invocation::Forward(CallKind::Buffered),
                         HeaderMode::Strict,
                     )
                     .unwrap();
@@ -2498,7 +2522,7 @@ stream_paths = ["/events"]
                 Namespace::Service,
                 caller,
                 call,
-                CallKind::Stream,
+                Invocation::Forward(CallKind::Stream),
                 HeaderMode::Strict,
             )
             .unwrap();
@@ -2550,7 +2574,7 @@ stream_paths = ["/events"]
                         Namespace::Service,
                         caller,
                         call2,
-                        CallKind::Stream,
+                        Invocation::Forward(CallKind::Stream),
                         HeaderMode::Strict,
                     )
                     .unwrap();

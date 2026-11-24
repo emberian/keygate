@@ -447,6 +447,7 @@ fn tooth_serve_hardens_the_process_and_checks_custody() {
 /// #tooth (audit 3): what `keygate init` writes is a separated deployment,
 /// and it boots as one: the initializing uid operates it and is not served
 /// as a caller.
+#[cfg(target_os = "linux")]
 #[test]
 fn tooth_default_init_boots_separated() {
     let dir = private_tempdir();
@@ -481,6 +482,23 @@ fn tooth_default_init_boots_separated() {
     );
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("own uid"), "{}", stderr(&refused));
+}
+
+/// Separated mode requires process memory protection implemented on Linux.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn separated_startup_refuses_missing_memory_protection() {
+    let dir = private_tempdir();
+    let state = dir.path().join("state");
+    ok(keygate(&state).arg("init"), "");
+    let refused = run(keygate(&state).arg("serve"), "");
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("cannot make this process's memory private"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!state.join("keygate.sock").exists());
 }
 
 /// #tooth (audit 5, 19): rotation retires, `forget` drops, and the CLI

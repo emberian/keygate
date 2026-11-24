@@ -2697,10 +2697,21 @@ async fn git_land_reconciles_lost_replies_and_retries_only_with_the_original_cas
         ],
     )
     .unwrap();
+    let git_token = |land: bool| {
+        let routes = keygate_core::macaroon::WorkerRoutes {
+            claim: None,
+            done: None,
+            land: land.then(|| "api".into()),
+            reconcile: (!land).then(|| "api".into()),
+        };
+        Broker::attenuate(&token, vec![Caveat::WorkerRoutes(routes)]).unwrap()
+    };
+    let land_token = git_token(true);
+    let reconcile_token = git_token(false);
     let request = |reference: &str| {
         let body = serde_json::json!({"repo":"api","reference":reference,"expected_old":old,"new_oid":new});
         call(
-            &token,
+            &land_token,
             "api",
             "POST",
             "/git/land",
@@ -2736,13 +2747,17 @@ async fn git_land_reconciles_lost_replies_and_retries_only_with_the_original_cas
     let _ = first.await;
     lost().await;
     let reconcile = |call| rig.broker.reconcile_git_push(AGENT, call, id);
+    assert_eq!(reconcile(req.clone()).unwrap_err().code, Code::Denied);
+    let mut settle = req.clone();
+    settle.token = reconcile_token;
+    assert_eq!(reserve(settle.clone()).unwrap_err().code, Code::Denied);
     let mut impostor = req.clone();
     impostor.token = root;
     assert!(reconcile(impostor).is_err());
     run(&["update-ref", reference, &other, &old]);
-    assert_eq!(reconcile(req.clone()).unwrap(), TicketState::Uncertain);
+    assert_eq!(reconcile(settle.clone()).unwrap(), TicketState::Uncertain);
     run(&["update-ref", reference, &old, &other]);
-    assert_eq!(reconcile(req.clone()).unwrap(), TicketState::SafeToRetry);
+    assert_eq!(reconcile(settle.clone()).unwrap(), TicketState::SafeToRetry);
     assert_eq!(up.hits(), 1);
     let second = send();
     tokio::time::timeout(WAIT, changed.notified())
@@ -2753,10 +2768,7 @@ async fn git_land_reconciles_lost_replies_and_retries_only_with_the_original_cas
     lost().await;
     run(&["update-ref", reference, &later, &new]);
     let rig = rig.reopen(BrokerOptions::default());
-    let state = rig
-        .broker
-        .reconcile_git_push(AGENT, req.clone(), id)
-        .unwrap();
+    let state = rig.broker.reconcile_git_push(AGENT, settle, id).unwrap();
     assert_eq!(state, TicketState::Committed);
     assert_eq!(rig.broker.ticket(id).unwrap().reserved_micro_usd, 3);
     assert!(rig.forward(S, req).await.is_err());

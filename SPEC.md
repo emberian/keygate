@@ -48,11 +48,12 @@ Common to both:
 ### 1.2 Capability tokens (`MacaroonV1`)
 
 - The operator mints a root token for a seat, bound to `(allowed_uid?, root_epoch)`, with chained BLAKE3 keyed MACs.
-- Any holder can attenuate offline by appending caveats; all caveats must hold, so appending only narrows: `Seat`, `Namespace`, `Rows`, `Methods`, `PathPrefixes`, `Models`, `MaxRequestBytes`, `MaxSpendMicroUsd`, `ExpiresAtUnixS`.
+- Any holder can attenuate offline by appending caveats; all caveats must hold, so appending only narrows: `Seat`, `Namespace`, `Rows`, `Methods`, `PathPrefixes`, `Models`, `MaxRequestBytes`, `MaxSpendMicroUsd`, `ExpiresAtUnixS`, `GitRef`, and `WorkerRoutes`.
 - `MaxSpendMicroUsd` is cumulative across the token and everything attenuated from it. It is enforced on priced provider rows; a token carrying it is refused on a provider row without prices, where the cap could not bind. Service calls are not metered.
 - `ExpiresAtUnixS` is bound to a monotonic deadline at admission (against the sub-second wall clock) so journal or audit contention never extends a capability's lifetime. A request whose deadline passes before `Begin` is refused before touching the network; an open stream whose deadline passes is cut (`closed_by: expired`). A buffered call already in flight is bounded by `buffered_timeout_ms` instead.
 - A clock that reads before 2025-06-15 or before the epoch is an error, not a zero: admission fails with `clock_failed`.
 - **Tickets belong to the exact token that opened them.** The request digest includes an id derived from the token's verified final tag and its spend scopes, so another token of the same seat, including one attenuated from the first, neither finds the first's reservation nor replays its retained reply.
+- `WorkerRoutes` (wire tag 11) encodes four length-prefixed row strings in claim, done, land and reconcile order. An empty string denies that operation. Admission requires a buffered service POST to the exact row and endpoint. The broker selects land or reconciliation from its own entry point. For reconciliation only, a terminal grant with reconcile enabled and land absent uses the ticket owner derived from the identical chain with that row moved to land. All other grant fields, spend scopes and request-digest inputs still match.
 - Uid-bound tokens are checked against kernel peer credentials on the Unix socket and refused on the HTTP gateway, which has none.
 
 ### 1.3 Response guard (`EchoGuard`)

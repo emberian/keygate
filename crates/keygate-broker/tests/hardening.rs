@@ -1601,11 +1601,16 @@ async fn tooth_client_verifies_the_broker_and_socket_mode_is_never_wider() {
             .is_ok());
         std::fs::set_permissions(rig.state(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    // Binding over a live broker is refused; over a dead one's socket, fine.
+    // An existing live socket must survive a second bind.
     let rig = Rig::new(&config(&up.origin));
     let first = Listeners::bind(&rig.broker).await.unwrap();
     assert!(Listeners::bind(&rig.broker).await.is_err());
+    let socket = first.socket_path.clone();
     drop(first);
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        assert!(Listeners::bind(&rig.broker).await.is_err());
+        std::fs::remove_file(socket).unwrap();
+    }
     assert!(Listeners::bind(&rig.broker).await.is_ok());
 }
 
@@ -1905,6 +1910,11 @@ async fn tooth_uncertain_requests_are_never_resent_however_late_the_retry() {
     // A restart and a compaction do not lose the record either.
     serving.abort();
     let _ = serving.await;
+    // We own this fixture and just joined its aborted listener. Platforms
+    // without a reliable stale-socket probe require explicit cleanup.
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        std::fs::remove_file(rig.state().join(&rig.broker.config().socket)).unwrap();
+    }
     let rig = rig.reopen(BrokerOptions::default());
     let (addr, _serving) = serve(&rig).await;
     assert_eq!(rig.broker.status().journal.uncertain, 1);

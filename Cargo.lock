@@ -669,6 +669,7 @@ dependencies = [
  "keygate-broker",
  "keygate-core",
  "ring",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

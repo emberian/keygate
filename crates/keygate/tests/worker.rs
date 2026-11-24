@@ -183,7 +183,7 @@ mod linux {
     use std::io::{Read, Write};
     use std::process::{Child, ExitStatus};
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     const WAIT: Duration = Duration::from_secs(20);
 
@@ -228,7 +228,12 @@ mod linux {
             return false;
         }
         let probe = Command::new(bwrap())
-            .args(["--unshare-all", "--unshare-user", "--die-with-parent"])
+            .args([
+                "--unshare-all",
+                "--unshare-user",
+                "--as-pid-1",
+                "--die-with-parent",
+            ])
             .args(["--ro-bind", "/", "/", "true"])
             .output();
         match probe {
@@ -379,19 +384,15 @@ mod linux {
 
         /// Wait for the pool to exit on its own.
         fn exited(mut self) -> (ExitStatus, String) {
+            // Keep stdin open until the pool has closed stdout itself. The
+            // read thread drops its sender at EOF. Drop still owns the child
+            // and reaps it if the deadline expires.
+            assert!(matches!(
+                self.frames.recv_timeout(WAIT),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
             let mut child = self.child.take().unwrap();
-            let deadline = Instant::now() + WAIT;
-            let status = loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    break status;
-                }
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("the pool did not exit");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
+            let status = child.wait().unwrap();
             let mut said = String::new();
             child
                 .stderr
@@ -443,6 +444,24 @@ mod linux {
 
     #[test]
     fn tooth_pool_runs_handlers_in_the_jail_and_holds_only_its_grant() {
+        use rustix::process::{set_child_subreaper, waitpid, Pid, WaitOptions};
+        // Adoption is process-wide. Run this case alone so the leak check
+        // cannot observe another parallel test's children.
+        const ISOLATED: &str = "KEYGATE_WORKER_TEST_SUBREAPER";
+        if std::env::var_os(ISOLATED).is_none() {
+            let thread = std::thread::current();
+            let name = thread.name().expect("named test");
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", stderr(&output));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            eprint!("{}", stderr(&output));
+            return;
+        }
+        set_child_subreaper(Some(Pid::INIT)).unwrap();
         if !host_can_jail() {
             return;
         }
@@ -500,6 +519,41 @@ mod linux {
             pool.run(8, "return 1", Value::Null),
             json!({"id": 8, "ok": true, "value": 1})
         );
+        pool.child.as_mut().unwrap().stdin.take();
+        assert!(pool.exited().0.success());
+        assert!(
+            matches!(
+                waitpid(None, WaitOptions::NOHANG),
+                Err(rustix::io::Errno::CHILD)
+            ),
+            "live or unreaped descendant after timeout, respawn and shutdown"
+        );
+    }
+
+    #[test]
+    fn pinned_node_is_hashed_again_on_timeout_recovery() {
+        if !host_can_jail() {
+            return;
+        }
+        let dir = private_dir();
+        let original = node();
+        let copy = dir.path().join("node");
+        std::fs::copy(&original, &copy).unwrap();
+        chmod(&copy, 0o755);
+        let report = check(&original, &[]);
+        assert!(report.status.success(), "{}", stderr(&report));
+        let report: Value = serde_json::from_slice(&report.stdout).unwrap();
+        let pin = report["node"]["sha256"].as_str().unwrap();
+        let mut pool = Pool::start(claim_pool(dir.path(), &copy).args(["--node-sha256", pin]));
+        assert_eq!(pool.run(1, "for(;;){}", Value::Null)["reason"], "timeout");
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"changed").unwrap();
+        chmod(&replacement, 0o755);
+        std::fs::rename(replacement, copy).unwrap();
+        assert_eq!(pool.run(2, "return 1", Value::Null)["reason"], "toolchain");
+        let (status, diagnostic) = pool.exited();
+        assert!(!status.success());
+        assert!(diagnostic.contains("SHA-256"), "{diagnostic}");
     }
 
     #[test]

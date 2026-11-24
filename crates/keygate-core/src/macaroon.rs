@@ -48,6 +48,7 @@ pub enum MacaroonError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Caveat {
+    WorkerRoutes(WorkerRoutes),
     GitRef {
         repo: String,
         reference: String,
@@ -68,6 +69,40 @@ pub enum Caveat {
     /// token attenuated from it, stays within this many micro-USD.
     MaxSpendMicroUsd(u64),
     ExpiresAtUnixS(u64),
+}
+
+/// Exact service rows for the four buffered worker operations. A missing
+/// row denies that operation, even when land and reconcile name the same CAS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRoutes {
+    pub claim: Option<String>,
+    pub done: Option<String>,
+    pub land: Option<String>,
+    pub reconcile: Option<String>,
+}
+
+/// The broker selects this from its entry point before checking the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Invocation {
+    Forward(crate::journal::CallKind),
+    Reconcile,
+}
+
+impl WorkerRoutes {
+    fn admits(&self, facts: &Facts<'_>, invocation: Invocation) -> bool {
+        use crate::journal::CallKind::Buffered;
+        if facts.namespace != Namespace::Service || facts.method != "POST" {
+            return false;
+        }
+        let row = match (invocation, facts.path.as_str()) {
+            (Invocation::Forward(Buffered), "/pod/claim") => &self.claim,
+            (Invocation::Forward(Buffered), "/pod/done") => &self.done,
+            (Invocation::Forward(Buffered), "/git/land") => &self.land,
+            (Invocation::Reconcile, "/git/land") => &self.reconcile,
+            _ => return false,
+        };
+        row.as_deref() == Some(facts.row)
+    }
 }
 
 /// What the operator binds at mint time.
@@ -127,6 +162,9 @@ pub struct Verified {
     /// of the verified final tag. Tickets are owned by it, so a different
     /// token of the same seat can neither find nor replay them.
     pub owner: [u8; 32],
+    /// Only for reconciliation: the matching land-only sibling with the
+    /// identical parent and pod routes, when the final caveat splits Git use.
+    pub reconcile_owner: Option<[u8; 32]>,
 }
 
 impl MacaroonV1 {
@@ -213,7 +251,19 @@ impl MacaroonV1 {
     pub fn verify(&self, root_key: &[u8; 32]) -> Result<Verified, MacaroonError> {
         let mut tag = Zeroizing::new(mac(root_key, ROOT_DOMAIN, &encode_root(&self.root)));
         let mut spend_scopes = Vec::new();
-        for caveat in &self.caveats {
+        let mut reconcile_owner = None;
+        for (index, caveat) in self.caveats.iter().enumerate() {
+            if index + 1 == self.caveats.len() {
+                if let Caveat::WorkerRoutes(routes) = caveat {
+                    if routes.land.is_none() && routes.reconcile.is_some() {
+                        let mut sibling = routes.clone();
+                        sibling.land = sibling.reconcile.take();
+                        let encoded = encode_caveat(&Caveat::WorkerRoutes(sibling))?;
+                        let sibling_tag = Zeroizing::new(mac(&tag, CAVEAT_DOMAIN, &encoded));
+                        reconcile_owner = Some(blake3::derive_key(OWNER_CONTEXT, &*sibling_tag));
+                    }
+                }
+            }
             *tag = mac(&tag, CAVEAT_DOMAIN, &encode_caveat(caveat)?);
             if let Caveat::MaxSpendMicroUsd(cap) = caveat {
                 spend_scopes.push(SpendScope {
@@ -229,6 +279,7 @@ impl MacaroonV1 {
             root: self.root.clone(),
             caveats: self.caveats.clone(),
             spend_scopes,
+            reconcile_owner,
             owner: blake3::derive_key(OWNER_CONTEXT, &*tag),
         })
     }
@@ -315,9 +366,25 @@ impl Verified {
         facts: &Facts<'_>,
         git_land: Option<&crate::git_land::GitLand>,
     ) -> Result<(), CaveatDenied> {
+        self.admit_invocation(
+            facts,
+            git_land,
+            Invocation::Forward(crate::journal::CallKind::Buffered),
+        )
+    }
+
+    pub fn admit_invocation(
+        &self,
+        facts: &Facts<'_>,
+        git_land: Option<&crate::git_land::GitLand>,
+        invocation: Invocation,
+    ) -> Result<(), CaveatDenied> {
         for (index, caveat) in self.caveats.iter().enumerate() {
             let deny = |reason: String| Err(CaveatDenied { index, reason });
             match caveat {
+                Caveat::WorkerRoutes(routes) if !routes.admits(facts, invocation) => {
+                    return deny("worker operation or row outside grant".into())
+                }
                 Caveat::GitRef { repo, reference }
                     if !git_land.is_some_and(|g| &g.repo == repo && &g.reference == reference) =>
                 {
@@ -492,6 +559,16 @@ fn decode_root(r: &mut Reader<'_>) -> Result<RootId, MacaroonError> {
 fn encode_caveat(caveat: &Caveat) -> Result<Vec<u8>, MacaroonError> {
     let mut w = Vec::with_capacity(32);
     match caveat {
+        Caveat::WorkerRoutes(routes) => {
+            w.push(11);
+            for row in [&routes.claim, &routes.done, &routes.land, &routes.reconcile] {
+                if row.as_ref().is_some_and(|row| !crate::valid_name(row)) {
+                    return Err(MacaroonError::Malformed("invalid worker row"));
+                }
+                // Empty is the canonical encoding of an absent row.
+                put_str(&mut w, row.as_deref().unwrap_or_default())?;
+            }
+        }
         Caveat::GitRef { repo, reference } => {
             w.push(10);
             put_str(&mut w, repo)?;
@@ -580,6 +657,18 @@ fn decode_caveat(enc: &[u8]) -> Result<Caveat, MacaroonError> {
             repo: r.string()?,
             reference: r.string()?,
         },
+        11 => {
+            let mut row = || -> Result<Option<String>, MacaroonError> {
+                let value = r.string()?;
+                Ok((!value.is_empty()).then_some(value))
+            };
+            Caveat::WorkerRoutes(WorkerRoutes {
+                claim: row()?,
+                done: row()?,
+                land: row()?,
+                reconcile: row()?,
+            })
+        }
         // An unknown caveat is a restriction this broker cannot evaluate;
         // ignoring it would widen the token.
         _ => return Err(MacaroonError::Malformed("unknown caveat kind")),
