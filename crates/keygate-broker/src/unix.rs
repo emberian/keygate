@@ -34,6 +34,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{watch, Semaphore};
 use zeroize::Zeroize;
 
+/// Linux answers a nonblocking connect to a listener whose accept queue is
+/// full with `EAGAIN`, and one to a socket nobody listens on with
+/// `ECONNREFUSED`, so a busy broker is never mistaken for a leftover socket.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn probe_existing_socket(path: &Path) -> io::Result<()> {
     use rustix::net::{
         connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType,
@@ -77,8 +81,25 @@ fn probe_existing_socket(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Bind the broker socket with `mode`. A leftover socket file from a dead
-/// broker is replaced; a live one is an error.
+/// BSD-derived kernels, macOS included, refuse a connect to a listener whose
+/// accept queue is full with `ECONNREFUSED`, the same error a dead listener
+/// gives. A probe there cannot tell a busy broker from a leftover socket, so
+/// an existing socket is never replaced.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn probe_existing_socket(path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "{} already exists, and on this system a busy broker cannot be told apart from a \
+             stale socket; remove it once no broker is listening there",
+            path.display()
+        ),
+    ))
+}
+
+/// Bind the broker socket with `mode`. On Linux a leftover socket file from
+/// a dead broker is replaced; a live one is an error, and elsewhere so is
+/// any existing socket.
 ///
 /// The socket is bound under a private temporary name, given its mode, and
 /// only then renamed into place, so it is never reachable at its public
@@ -907,6 +928,7 @@ mod tests {
     /// #tooth (C-4): `unix::bind` probes an existing socket with `SOCK_NONBLOCK`
     /// so a live listener with a completely full accept backlog returns
     /// `AddrInUse` immediately instead of blocking in `connect(2)`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn tooth_bind_probes_full_backlog_socket_without_blocking() {
         use rustix::net::{
@@ -991,6 +1013,33 @@ mod tests {
             original_ino
         );
         drop(rebound);
+    }
+
+    /// Where a full accept queue looks like a dead listener, `unix::bind`
+    /// keeps any socket file it finds, live or stale.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[tokio::test]
+    async fn bind_keeps_existing_socket_where_busy_and_stale_look_alike() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("kept.sock");
+        let live = bind(&sock, 0o600).unwrap();
+        let original_ino = std::fs::symlink_metadata(&sock).unwrap().ino();
+        assert_eq!(
+            bind(&sock, 0o600).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        drop(live);
+        assert_eq!(
+            bind(&sock, 0o600).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse,
+            "a stale socket is left for the operator to remove"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&sock).unwrap().ino(),
+            original_ino
+        );
     }
 
     /// #tooth (C-7): an unauthenticated peer pipelining `Hello` frames without

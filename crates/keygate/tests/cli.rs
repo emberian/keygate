@@ -45,10 +45,12 @@ impl Daemon {
         Daemon(Some(child))
     }
 
+    #[cfg(target_os = "linux")]
     fn id(&self) -> u32 {
         self.0.as_ref().expect("live child").id()
     }
 
+    #[cfg(target_os = "linux")]
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.0.as_mut().expect("live child").try_wait()
     }
@@ -319,6 +321,7 @@ fn start(state: &Path, config: Option<&str>) -> Daemon {
 /// Run a command that is expected to exit on its own. If it is still
 /// running after ten seconds (a broker that started when it should have
 /// refused), it is killed and reported as having succeeded.
+#[cfg(target_os = "linux")]
 fn exits(command: &mut Command) -> Output {
     let mut child = Daemon::new(
         command
