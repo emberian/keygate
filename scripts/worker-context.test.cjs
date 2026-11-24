@@ -6,7 +6,7 @@ const {once} = require('node:events')
 const path = require('node:path')
 
 test('framed context has frozen intrinsics and exchanges only capability messages', async t => {
-  const child = spawn(process.execPath,[path.join(__dirname,'../crates/keygate/src/bin/context.cjs')], {
+  const child = spawn(process.execPath,['--jitless',path.join(__dirname,'../crates/keygate/src/bin/context.cjs')], {
     env:{BROKER_CANARY:'host-only-cookie'},stdio:['pipe','pipe','inherit']
   })
   t.after(() => child.kill())
@@ -44,4 +44,20 @@ test('framed context has frozen intrinsics and exchanges only capability message
   const ended=once(child,'exit')
   child.stdin.end()
   assert.equal((await ended)[0],0)
+})
+
+test('a runtime that leaves WebAssembly reachable is refused before it is ready', {timeout:10000}, async () => {
+  // Started without --jitless, unlike the supervisor's jail. With its input
+  // closed, a script that wrongly accepted the runtime exits 0 at end of file.
+  const child = spawn(process.execPath,[path.join(__dirname,'../crates/keygate/src/bin/context.cjs')], {
+    stdio:['pipe','pipe','pipe']
+  })
+  child.stdin.end()
+  const out=[], err=[]
+  child.stdout.on('data', d => out.push(d))
+  child.stderr.on('data', d => err.push(d))
+  const [code]=await once(child,'close')
+  assert.equal(code,1)
+  assert.equal(Buffer.concat(out).length,0,'no ready frame')
+  assert.match(Buffer.concat(err).toString(),/exposes WebAssembly under --jitless/)
 })

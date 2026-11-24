@@ -665,8 +665,10 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
+ "hex",
  "keygate-broker",
  "keygate-core",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

@@ -4,6 +4,17 @@
 'use strict'
 const vm = require('node:vm')
 const fs = require('node:fs')
+// The jail depends on two runtime properties; refuse before announcing
+// readiness when either is missing.
+function refuse(why) {
+  process.stderr.write(`keygate-worker: this Node ${why}\n`)
+  process.exit(1)
+}
+// Without this constant, createContext silently builds an ordinary
+// contextified realm instead.
+if (vm.constants?.DONT_CONTEXTIFY === undefined) refuse('has no vm.constants.DONT_CONTEXTIFY')
+// The supervisor runs Node with --jitless, which must leave no WebAssembly.
+if (typeof WebAssembly !== 'undefined') refuse('exposes WebAssembly under --jitless')
 const LIMIT = 65536
 function read(size) {
   const data = Buffer.alloc(size)

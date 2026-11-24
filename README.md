@@ -6,7 +6,7 @@ The broker keeps upstream credentials in a sealed store. Callers hold attenuable
 
 ## Development status
 
-Experimental. Three rounds of security hardening have been applied — including an independent review and a follow-up audit — recorded finding by finding in [HARDENING.md](HARDENING.md), with the test that pins each fix. The suite (unit tests, adversarial integration tests over the real Unix socket and HTTP gateway, fault injection, a run on a genuinely full filesystem, real separated-uid acceptance, and end-to-end tests of the binary) passes on Linux. It has never been built or run on macOS.
+Experimental. Three rounds of security hardening have been applied — including an independent review and a follow-up audit — recorded finding by finding in [HARDENING.md](HARDENING.md), with the test that pins each fix. The suite (unit tests, adversarial integration tests over the real Unix socket and HTTP gateway, fault injection, a run on a genuinely full filesystem, real separated-uid acceptance, and end-to-end tests of the binary) passes on Linux. It also builds without warnings on macOS, where only the worker's unit and refusal tests and the socket-replacement test have been run.
 
 Things that are true whatever the tests say:
 
@@ -93,7 +93,8 @@ Licensed under either the [MIT license](LICENSE-MIT) or the [Apache License, Ver
 ### Running JavaScript handlers
 
 `keygate-worker` supervises a persistent pool on Linux with Bubblewrap, util-linux
-`prlimit`, and system Node with `vm.constants.DONT_CONTEXTIFY`. Each worker gets
+`prlimit`, and a Node whose `vm` module has `constants.DONT_CONTEXTIFY` (22.8 or later;
+20.18 on the 20 line). Each worker gets
 a private user, PID and network namespace, a read-only Node runtime, empty environment
 and framed pipes. The Rust supervisor owns the macaroon and the 50 ms invocation
 deadline. An interrupted call can already have reached its service. Reuse the same
@@ -110,6 +111,41 @@ keygate-worker --socket "$socket" --token-file "$token_file" --seat ci \
   --allow pod.claim,pod.done,git.land,git.reconcile
 ```
 
+The pool's macaroon admits only the rows and paths its `--allow` operations use:
+`pod.claim` and `pod.done` call `--pod-row` at `/pod/claim` and `/pod/done`;
+`git.land` and `git.reconcile` call `--git-row` at `/git/land` (the broker admits a
+reconcile as the land call it settles). A row no allowed operation uses need not be
+given and is not granted. Tickets belong to the exact token that opened them, and
+pools with equal options hold equal tokens however `--allow` is ordered, so a
+`git.reconcile` pool settles what a `git.land` pool with the same options left
+uncertain. A pool granted all four operations holds the token earlier releases gave
+every pool. A pool granted fewer now holds a narrower token, and `Uncertain` tickets
+it opened before the upgrade cannot be reconciled through it.
+
+The jail runs `/usr/bin/prlimit`, `/usr/bin/bwrap` and `/usr/bin/node` unless
+`--prlimit-bin`, `--bwrap-bin` and `--node-bin` name other absolute paths. `PATH` is
+never searched, and a relative path or one containing `..` is refused before anything
+is looked up. Each binary is resolved to its canonical path and must be a regular
+executable file owned by root or the worker's uid, writable by neither group nor
+others, in a directory writable by neither, below directories only root or that uid
+can rearrange (sticky directories excepted). `--prlimit-sha256`, `--bwrap-sha256`
+and `--node-sha256` pin a binary's SHA-256. Node is bound into each sandbox at its
+canonical path; `--node-lib-dir` binds another directory its shared libraries need,
+under the same rules, and never one that contains the token file or the socket.
+Before restarting a worker after a timeout or crash, the supervisor checks that each
+binary is still the file it verified (device, inode, size, mode, owner, modification
+and change times). If one is not, it answers that job with `"reason":"toolchain"`
+and exits with an error; restart the pool to verify the new files.
+
+`keygate-worker --check-toolchain-only`, with the same toolchain options, verifies the
+binaries, starts one sandboxed worker, prints the canonical paths and SHA-256 digests
+as JSON and exits without reading a token. Use it as a packaging check or systemd
+`ExecStartPre`, and to read the digests to pin. When the sandbox does not start, its
+standard error carries what Bubblewrap or Node reported. Where only profiled binaries
+may create user namespaces (Ubuntu's `kernel.apparmor_restrict_unprivileged_userns`),
+`/usr/bin/bwrap` cannot set up the jail's network namespace; name a bwrap whose
+AppArmor profile allows `userns` with `--bwrap-bin`.
+
 Use one pool per trust principal. Requests and responses are JSON with a four-byte
 big-endian length prefix and a 64 KiB limit. Wait for the ready frame before sending
 requests of the form `{"id":1,"source":"return yield caps.pod.claim(input)","input":...}`.
@@ -119,7 +155,11 @@ with the ticket additionally required for reconciliation. The supervisor returns
 typed results and request IDs. Realms are private to a worker, principal and exact
 handler source. Instances of the same handler can retain realm state between calls.
 
-Run `node --test scripts/worker-context.test.cjs` for the realm and wire checks.
+Run `node --test scripts/worker-context.test.cjs` for the realm and wire checks, and
+`cargo test -p keygate --test worker` for the binary: on Linux it runs pools in
+Bubblewrap, reading `KEYGATE_WORKER_TEST_BWRAP` and `KEYGATE_WORKER_TEST_NODE` where
+the system bwrap may not create user namespaces or the system Node is too old, and
+printing `SKIPPED` with the reason when the host cannot build the jail.
 With built binaries on PATH, `python3 scripts/worker-acceptance.py` exercises the
 jail, real pod transactions, spend refusal and an authoritative Git ref update
 whose reply was lost. The benchmark places its journal and database on the
